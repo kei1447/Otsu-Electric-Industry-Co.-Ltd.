@@ -55,7 +55,7 @@ if check_password():
             st.markdown("電脳工場から出力した製品リスト(.xls)を、見やすいテーブル形式に変換します。")
             st.markdown("---")
             # ラベルもファイル名ベースに変更
-            st.page_link("pages/denno_tool.py", label="denno_tool を起動", icon="✨")
+            st.page_link("pages/price_list_convert.py", label="price_list_convert を起動", icon="✨")
 
     # 今後の拡張用スペース
     st.divider()
