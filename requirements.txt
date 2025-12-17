@@ -1,1 +1,7 @@
 streamlit
+opencv-python-headless
+pdf2image
+Pillow
+ultralytics
+google-cloud-vision
+pandas
