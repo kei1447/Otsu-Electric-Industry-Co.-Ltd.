@@ -5,3 +5,4 @@ Pillow
 ultralytics
 google-cloud-vision
 pandas
+openpyxl
