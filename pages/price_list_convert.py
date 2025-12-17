@@ -7,6 +7,10 @@ from openpyxl.styles import Font
 from openpyxl.worksheet.table import Table, TableStyleInfo
 from openpyxl.utils import get_column_letter
 
+if "password_correct" not in st.session_state or not st.session_state["password_correct"]:
+    st.warning("⚠️ ログインしていません。左上の「app」に戻ってログインしてください。")
+    st.stop()
+
 # --- 設定 ---
 NEW_COLUMNS = [
     "品目コード", "機種", "品名", "背番号", "単位", 

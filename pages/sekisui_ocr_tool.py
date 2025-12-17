@@ -9,6 +9,10 @@ from ultralytics import YOLO
 from google.cloud import vision
 from google.oauth2 import service_account
 
+if "password_correct" not in st.session_state or not st.session_state["password_correct"]:
+    st.warning("⚠️ ログインしていません。左上の「app」に戻ってログインしてください。")
+    st.stop()
+
 # --- 設定 ---
 YOLO_MODEL_PATH = "best.pt" 
 MAX_PAIRS_PER_IMAGE = 12
@@ -319,7 +323,7 @@ def perform_ocr_and_parse(combined_data):
 def main():
     st.set_page_config(page_title="OCR Tool", layout="wide")
     
-    st.title("📄 AI-OCR 自動集計ツール (高精度版)")
+    st.title("📄セキスイ 電着塗装依頼書OCR")
     st.markdown("YOLO検出 → 座標ベースOCR解析 → 編集＆ダウンロード")
     st.markdown("※品名内の 'O/o' は自動的に '0' に変換されます。")
 
