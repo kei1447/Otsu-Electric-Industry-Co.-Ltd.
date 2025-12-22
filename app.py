@@ -42,7 +42,7 @@ if check_password():
         with st.container(border=True):
             # タイトルをファイル名に変更
             st.markdown("### 📄 sekisui_ocr_tool.py")
-            st.markdown("図面データ(PDF/TIFF)から、品名と数量をAIが読み取り一覧化します。")
+            st.markdown("書類データ(PDF/TIFF)から、品名と数量をAIが読み取り一覧化します。")
             st.markdown("---")
             # ラベルもファイル名ベースに変更
             st.page_link("pages/sekisui_ocr_tool.py", label="sekisui_ocr_tool を起動", icon="🚀")
