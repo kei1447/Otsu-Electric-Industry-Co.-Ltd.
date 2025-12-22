@@ -7,3 +7,5 @@ google-cloud-vision
 pandas
 openpyxl
 xlrd
+sqlalchemy
+psycopg2-binary
