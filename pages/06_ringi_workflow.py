@@ -31,28 +31,20 @@ def create_digital_stamp(name, date_str):
     draw.line((padding, line_y2, STAMP_SIZE - padding, line_y2), fill=STAMP_COLOR, width=2)
 
     # 4. 文字を描く
-    # フォントが無いとエラーになるのでデフォルトロードを試みる
-    # ※本番では日本語フォントファイル(.ttf)をフォルダに置いて指定するのがベスト
-    try:
-        # Windows等に入っているフォントを指定する場合（環境による）
-        # font = ImageFont.truetype("msgothic.ttc", 18) 
-        # Streamlit Cloud用にはデフォルトを使用（日本語が出ない可能性あり）
-        # そのため、今回は簡易的に描画します
-        font_date = ImageFont.load_default()
-        font_name = ImageFont.load_default()
-    except:
-        font_date = None
-        font_name = None
+    # --- 修正前 ---
+    # font_date = ImageFont.load_default()
 
-    # 本来はここで日本語描画を行いますが、環境依存を避けるため
-    # Streamlit Cloud上では「日付」のみを中央に描画する簡易版とします
-    # ★本格実装時は、NotoSansJP.ttf などを同梱して読み込ませます
+try:
+    # フォルダ名/ファイル名 を指定
+    font_path = "fonts/ShipporiMincho-Bold.ttf" 
     
-    # 日付 (2025.12.23)
-    # テキストの位置調整などは微調整が必要
-    # ここではシンプル化のため実装ロジックのみ提示
-    
-    return img
+    # サイズを指定してロード (日付用と名前用でサイズを変えるとリアルです)
+    font_name = ImageFont.truetype(font_path, 24) # 名前は大きく
+    font_date = ImageFont.truetype(font_path, 14) # 日付は小さく
+except IOError:
+    # フォントが見つからない時のバックアップ
+    font_name = ImageFont.load_default()
+    font_date = ImageFont.load_default()
 
 # --- 本番に向けた改良版スタンプ生成（日本語フォントなしでも動く版） ---
 def generate_simple_stamp(text_top, text_date, text_bottom):
