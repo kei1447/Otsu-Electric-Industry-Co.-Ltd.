@@ -114,9 +114,11 @@ with col1:
     approver_name = st.text_input("承認者名（名字）", "日比野")
     
     # 承認ボタン
-    if st.button("承認する（現在時刻で捺印）"):
-        # ボタンを押した瞬間の日時を取得
-        now = datetime.datetime.now()
+if st.button("承認する（現在時刻で捺印）"):
+        # 日本時間 (UTC+9) のタイムゾーンを定義
+        JST = datetime.timezone(datetime.timedelta(hours=9))
+        # 日本時間を指定して現在時刻を取得
+        now = datetime.datetime.now(JST)
         
         stamp_img = create_digital_stamp(approver_name, now)
         st.session_state["demo_stamp"] = stamp_img
