@@ -8,95 +8,100 @@ STAMP_SIZE = 120
 STAMP_COLOR = (220, 50, 50) # 朱色
 
 # ★ここにアップロードしたフォントファイル名を正確に入力してください★
+# ※もしファイル名が違う場合は書き換えてください
 FONT_FILENAME = "ShipporiMincho-Bold.ttf" 
 
 def get_font_path():
     """フォントファイルの場所を賢く探す関数"""
-    # 候補1: ルートの fonts フォルダにある場合 (標準)
     path1 = os.path.join("fonts", FONT_FILENAME)
-    # 候補2: 同じフォルダにある場合
     path2 = FONT_FILENAME
-    # 候補3: pagesフォルダの中に fonts がある場合
     path3 = os.path.join("pages", "fonts", FONT_FILENAME)
     
-    if os.path.exists(path1):
-        return path1
-    elif os.path.exists(path2):
-        return path2
-    elif os.path.exists(path3):
-        return path3
-    else:
-        return None
+    if os.path.exists(path1): return path1
+    elif os.path.exists(path2): return path2
+    elif os.path.exists(path3): return path3
+    else: return None
 
 def create_digital_stamp(name_text, date_text):
     """
-    名前と日付を受け取り、電子印鑑画像(PNG)を生成して返す関数
+    電子印鑑生成（デザイン調整版）
+    - 上段：承認（大きく）
+    - 中段：日付（少し大きく）
+    - 下段：名前（3文字対応・自動縮小）
+    - 配置：完全中央揃え
     """
-    # 1. キャンバス作成（背景透明）
+    # 1. キャンバス作成
     img = Image.new('RGBA', (STAMP_SIZE, STAMP_SIZE), (255, 255, 255, 0))
     draw = ImageDraw.Draw(img)
 
     # 2. 外枠の円
-    margin = 5
+    margin = 4
     draw.ellipse(
         (margin, margin, STAMP_SIZE - margin, STAMP_SIZE - margin),
         outline=STAMP_COLOR,
         width=3
     )
     
-    # 3. 横線（日付の上下）
-    line_y1 = STAMP_SIZE * 0.36
-    line_y2 = STAMP_SIZE * 0.64
-    padding = 15
+    # 3. 区切り線の位置定義（全体のバランス調整）
+    # 上段(承認)エリア: 0% ～ 36%
+    # 中段(日付)エリア: 36% ～ 64%
+    # 下段(名前)エリア: 64% ～ 100%
+    line_y1 = int(STAMP_SIZE * 0.36)
+    line_y2 = int(STAMP_SIZE * 0.64)
+    
+    # 線を描画
+    padding = 12 # 線の左右の余白
     draw.line((padding, line_y1, STAMP_SIZE - padding, line_y1), fill=STAMP_COLOR, width=2)
     draw.line((padding, line_y2, STAMP_SIZE - padding, line_y2), fill=STAMP_COLOR, width=2)
 
-    # 4. フォントの読み込み
+    # 4. フォント読み込みとサイズ設定
     font_path = get_font_path()
     
-    if font_path:
-        try:
-            # 正常にフォントが見つかった場合
-            # 名前用（大きめ）
-            font_name = ImageFont.truetype(font_path, 24)
-            # 日付用（小さめ）
-            font_date = ImageFont.truetype(font_path, 14)
-        except Exception as e:
-            st.error(f"フォント読み込みエラー: {e}")
-            return img
-    else:
-        # フォントが見つからない場合のエラー表示
-        st.error(f"⚠️ フォントファイル '{FONT_FILENAME}' が見つかりませんでした。")
-        st.info("確認: 'fonts' フォルダの中に .ttf ファイルが入っていますか？")
-        # デバッグ用: 現在のファイル構成を表示
-        st.write("現在の場所:", os.getcwd())
-        if os.path.exists("fonts"):
-            st.write("fontsフォルダの中身:", os.listdir("fonts"))
-        else:
-            st.write("fontsフォルダ自体が見つかりません。")
+    if not font_path:
+        st.error(f"フォントファイル '{FONT_FILENAME}' が見つかりません。")
         return img
 
-    # 5. 文字の描画（中央揃え計算）
-    # --- 日付 (中段) ---
-    bbox = draw.textbbox((0, 0), date_text, font=font_date)
-    w = bbox[2] - bbox[0]
-    h = bbox[3] - bbox[1]
-    draw.text(((STAMP_SIZE - w) / 2, (STAMP_SIZE - h) / 2), date_text, font=font_date, fill=STAMP_COLOR)
+    try:
+        # --- 文字サイズの調整 ---
+        
+        # 上段「承認」: 大きくドシッと
+        size_top = 22 
+        font_top = ImageFont.truetype(font_path, size_top)
 
-    # --- 名前 (下段) ---
-    # ※名字が2文字の場合のバランス調整
-    bbox = draw.textbbox((0, 0), name_text, font=font_name)
-    w = bbox[2] - bbox[0]
-    # 下段の中心位置におく
-    y_pos = line_y2 + 5 
-    draw.text(((STAMP_SIZE - w) / 2, y_pos), name_text, font=font_name, fill=STAMP_COLOR)
+        # 中段「日付」: 少し大きく見やすく
+        size_date = 15 
+        font_date = ImageFont.truetype(font_path, size_date)
+
+        # 下段「名前」: 文字数によってサイズを自動変更
+        if len(name_text) >= 3:
+            size_name = 18 # 3文字以上なら少し小さくして収める
+        else:
+            size_name = 24 # 2文字以下なら大きく
+        font_name = ImageFont.truetype(font_path, size_name)
+
+    except Exception as e:
+        st.error(f"フォント読み込みエラー: {e}")
+        return img
+
+    # 5. 文字の描画（完全中央揃えロジック）
+    # anchor="mm" (Middle-Middle) を使うと、指定した座標が文字の中心になります
     
-    # --- 役職/上段 (今回は簡易的に「認」または空欄) ---
-    top_text = "認"
-    bbox = draw.textbbox((0, 0), top_text, font=font_date)
-    w = bbox[2] - bbox[0]
-    y_pos_top = line_y1 - 18
-    draw.text(((STAMP_SIZE - w) / 2, y_pos_top), top_text, font=font_date, fill=STAMP_COLOR)
+    # --- 上段：「承認」 ---
+    # エリアの中心Y座標 = (0 + line_y1) / 2
+    center_y_top = line_y1 / 2
+    draw.text((STAMP_SIZE / 2, center_y_top), "承認", font=font_top, fill=STAMP_COLOR, anchor="mm")
+
+    # --- 中段：日付 ---
+    # エリアの中心Y座標 = (line_y1 + line_y2) / 2
+    center_y_date = (line_y1 + line_y2) / 2
+    # 少しだけ上に補正（フォントのベースライン調整）
+    draw.text((STAMP_SIZE / 2, center_y_date - 1), date_text, font=font_date, fill=STAMP_COLOR, anchor="mm")
+
+    # --- 下段：名前 ---
+    # エリアの中心Y座標 = (line_y2 + STAMP_SIZE) / 2
+    center_y_name = (line_y2 + STAMP_SIZE) / 2
+    # 円の下部にぶつからないよう少し上に補正
+    draw.text((STAMP_SIZE / 2, center_y_name - 2), name_text, font=font_name, fill=STAMP_COLOR, anchor="mm")
 
     return img
 
@@ -107,17 +112,16 @@ col1, col2 = st.columns(2)
 
 with col1:
     st.subheader("承認アクション")
-    approver_name = st.text_input("承認者名（名字）", "大津")
-    # 今日の日付を文字列に (例: 25.12.23)
+    # デフォルトを3文字ネームにしてテストしやすくしました
+    approver_name = st.text_input("承認者名（名字）", "佐々木")
+    
     today = datetime.date.today()
     date_str = f"{today.year-2000}.{today.month:02}.{today.day:02}"
     
     if st.button("承認する（ハンコ生成）"):
-        # ハンコ画像を生成
         stamp_img = create_digital_stamp(approver_name, date_str)
         st.session_state["demo_stamp"] = stamp_img
         
-        # フォントが見つかっていれば成功メッセージ
         if get_font_path():
             st.success("電子印影を生成しました！")
 
