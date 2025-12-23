@@ -70,7 +70,7 @@ def login_page():
         
         with st.form("login_form"):
             st.write("ログイン情報を入力してください")
-            email = st.text_input("メールアドレス", placeholder="yourname@otsu-elec.co.jp")
+            email = st.text_input("メールアドレス", placeholder="yourname@otsudenki.co.jp")
             password = st.text_input("パスワード", type="password")
             
             submitted = st.form_submit_button("ログイン", use_container_width=True)
