@@ -6,32 +6,39 @@ import datetime
 import io
 import base64
 import os
+import uuid
+from supabase import create_client
 
 # --- 設定 ---
 STAMP_SIZE = 120
 STAMP_COLOR = (220, 50, 50)
-# ★GitHubにアップしたフォントファイル名に合わせてください
 FONT_FILENAME = "ShipporiMincho-Bold.ttf" 
+
+# --- Supabaseクライアント初期化 (Storage操作用) ---
+try:
+    SUPABASE_URL = st.secrets["connections"]["supabase"]["project_url"]
+    SUPABASE_KEY = st.secrets["connections"]["supabase"]["key"]
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+except:
+    st.error("Secretsの設定が不足しています。")
+    st.stop()
 
 # --- 関数群 ---
 def get_font_path():
-    """フォントファイルを賢く探す"""
     path1 = os.path.join("fonts", FONT_FILENAME)
     path2 = FONT_FILENAME
     path3 = os.path.join("pages", "fonts", FONT_FILENAME)
-    
     if os.path.exists(path1): return path1
     elif os.path.exists(path2): return path2
     elif os.path.exists(path3): return path3
     else: return None
 
 def create_digital_stamp(name_text, datetime_obj):
-    """電子印鑑生成（以前作成した完成版ロジック）"""
+    """電子印鑑生成"""
     img = Image.new('RGBA', (STAMP_SIZE, STAMP_SIZE), (255, 255, 255, 0))
     draw = ImageDraw.Draw(img)
     margin = 4
     draw.ellipse((margin, margin, STAMP_SIZE - margin, STAMP_SIZE - margin), outline=STAMP_COLOR, width=3)
-    
     line_y1 = int(STAMP_SIZE * 0.34)
     line_y2 = int(STAMP_SIZE * 0.66)
     padding = 12
@@ -46,17 +53,14 @@ def create_digital_stamp(name_text, datetime_obj):
             size_name = 18 if len(name_text) >= 3 else 24
             font_name = ImageFont.truetype(font_path, size_name)
             
-            # 上段: 承認
             draw.text((STAMP_SIZE/2, line_y1/2), "承認", font=font_top, fill=STAMP_COLOR, anchor="mm")
-            # 中段: 日付
             date_str = datetime_obj.strftime("%Y/%m/%d\n%H:%M:%S")
             center_y_date = (line_y1 + line_y2) / 2
             draw.multiline_text((STAMP_SIZE/2, center_y_date), date_str, font=font_date, fill=STAMP_COLOR, anchor="mm", align="center", spacing=1)
-            # 下段: 名前
             center_y_name = (line_y2 + STAMP_SIZE) / 2
             draw.text((STAMP_SIZE/2, center_y_name - 2), name_text, font=font_name, fill=STAMP_COLOR, anchor="mm")
         except:
-            pass # エラー時は枠線のみ
+            pass
     return img
 
 def image_to_base64(img):
@@ -64,37 +68,54 @@ def image_to_base64(img):
     img.save(buffered, format="PNG")
     return base64.b64encode(buffered.getvalue()).decode()
 
-def base64_to_image(b64_str):
-    return Image.open(io.BytesIO(base64.b64decode(b64_str)))
+def upload_file_to_storage(uploaded_file):
+    """ファイルをSupabase Storageにアップロードし、公開URLを返す"""
+    if uploaded_file is None:
+        return None, None
+    
+    try:
+        # ファイル名が重複しないようにUUIDを付与
+        file_ext = os.path.splitext(uploaded_file.name)[1]
+        unique_filename = f"{uuid.uuid4()}{file_ext}"
+        bucket_name ="workflow_files" # Step1で作ったバケツ名
+        
+        # アップロード実行
+        file_bytes = uploaded_file.getvalue()
+        supabase.storage.from_(bucket_name).upload(
+            path=unique_filename,
+            file=file_bytes,
+            file_options={"content-type": uploaded_file.type}
+        )
+        
+        # 公開URLを取得
+        public_url = supabase.storage.from_(bucket_name).get_public_url(unique_filename)
+        return public_url, uploaded_file.name
+        
+    except Exception as e:
+        st.error(f"ファイルアップロードエラー: {e}")
+        return None, None
 
 # --- メイン処理 ---
 def main():
     st.title("🈸 稟議・申請ワークフロー")
 
-    # 1. ログインチェック
     if "is_logged_in" not in st.session_state or not st.session_state["is_logged_in"]:
         st.error("ログインしてください。")
         st.stop()
     
-    # セッションからユーザー情報を取得
-    my_name = st.session_state["user_name"] # 例: 日比野 圭祐
-    my_role = st.session_state["role"]      # 例: 課長
+    my_name = st.session_state["user_name"]
+    my_role = st.session_state["role"]
     my_email = st.session_state["user_email"]
-    
-    # ハンコ用名字 (スペースで切るか、先頭2文字)
     stamp_name = my_name.split(" ")[0] if " " in my_name else my_name[0:2]
 
-    # 管理職判定 (承認タブを表示するか？)
     manager_roles = ["課長", "部長", "社長", "専務", "常務", "工場長"]
     is_manager = any(role in my_role for role in manager_roles)
 
-    # タブの作成
     tab_titles = ["📄 新規申請", "🗂 申請履歴"]
     if is_manager:
         tab_titles.append("✅ 承認待ち案件")
     
     tabs = st.tabs(tab_titles)
-    
     conn = st.connection("supabase", type="sql")
 
     # --- TAB 1: 新規申請 ---
@@ -105,6 +126,9 @@ def main():
             amount = st.number_input("金額 (円)", step=1000)
             content = st.text_area("申請理由・詳細", height=150)
             
+            # ★ファイルアップロード機能★
+            uploaded_file = st.file_uploader("添付資料 (見積書PDFなど)", type=["pdf", "jpg", "png", "xlsx"])
+            
             submitted = st.form_submit_button("申請する", type="primary")
             
             if submitted:
@@ -112,20 +136,31 @@ def main():
                     st.warning("件名は必須です。")
                 else:
                     try:
+                        file_url = None
+                        file_name = None
+                        
+                        # ファイルがあればアップロード処理
+                        if uploaded_file:
+                            with st.spinner("ファイルをアップロード中..."):
+                                file_url, file_name = upload_file_to_storage(uploaded_file)
+                        
                         with conn.session as s:
-                            # 1. ヘッダー保存
+                            # DB保存 (file_url, file_nameを追加)
                             row = s.execute(
                                 text("""
-                                INSERT INTO T_Ringi_Header (applicant_name, applicant_email, subject, amount, content)
-                                VALUES (:nm, :em, :sub, :amt, :cnt)
+                                INSERT INTO T_Ringi_Header 
+                                (applicant_name, applicant_email, subject, amount, content, file_url, file_name)
+                                VALUES (:nm, :em, :sub, :amt, :cnt, :furl, :fname)
                                 RETURNING ringi_id
                                 """),
-                                {"nm": my_name, "em": my_email, "sub": subject, "amt": amount, "cnt": content}
+                                {
+                                    "nm": my_name, "em": my_email, "sub": subject, 
+                                    "amt": amount, "cnt": content,
+                                    "furl": file_url, "fname": file_name
+                                }
                             ).fetchone()
                             new_id = row[0]
                             
-                            # 2. 承認ルート自動生成 (今回は固定: 課長→部長→社長)
-                            # ※本来は申請者の部署などで分岐させます
                             route = ["課長", "部長", "社長"]
                             for r in route:
                                 s.execute(
@@ -134,25 +169,31 @@ def main():
                                 )
                             s.commit()
                         st.success(f"申請完了！ (管理No: {new_id})")
+                        
                     except Exception as e:
                         st.error(f"エラーが発生しました: {e}")
 
     # --- TAB 2: 申請履歴 ---
     with tabs[1]:
-        st.caption("自分が申請した案件の進捗状況です。")
-        # 自分のメアドで検索
-        df_my = conn.query(f"SELECT * FROM T_Ringi_Header WHERE applicant_email = '{my_email}' ORDER BY ringi_id DESC", ttl=0)
-        st.dataframe(df_my, use_container_width=True)
+        # file_name列も取得するように変更
+        df_my = conn.query(f"SELECT ringi_id, created_at, subject, amount, status, file_name, file_url FROM T_Ringi_Header WHERE applicant_email = '{my_email}' ORDER BY ringi_id DESC", ttl=0)
+        
+        # データフレームだとURLがクリックしにくいので、簡単なリスト表示にする
+        if df_my.empty:
+            st.info("申請履歴はありません。")
+        else:
+            st.dataframe(df_my, column_config={
+                "file_url": st.column_config.LinkColumn("添付ファイル")
+            }, use_container_width=True)
 
-    # --- TAB 3: 承認作業 (管理職のみ) ---
+    # --- TAB 3: 承認作業 ---
     if is_manager and len(tabs) > 2:
         with tabs[2]:
             st.subheader(f"承認トレイ ({my_role})")
-            
-            # 「自分の役職」宛てで、まだ「未承認」のものを取得
-            # かつ、その案件自体が「却下」されていないもの
+            # file_url, file_nameを取得に追加
             sql = f"""
-                SELECT h.ringi_id, h.subject, h.applicant_name, h.amount, h.content, h.created_at, a.approval_id
+                SELECT h.ringi_id, h.subject, h.applicant_name, h.amount, h.content, 
+                       h.created_at, h.file_url, h.file_name, a.approval_id
                 FROM T_Ringi_Header h
                 JOIN T_Ringi_Approvals a ON h.ringi_id = a.ringi_id
                 WHERE a.approver_role = '{my_role}' 
@@ -163,26 +204,29 @@ def main():
             df_pending = conn.query(sql, ttl=0)
             
             if df_pending.empty:
-                st.info("現在、あなたの承認待ち案件はありません。")
+                st.info("承認待ち案件はありません。")
             else:
                 for i, row in df_pending.iterrows():
                     with st.container(border=True):
                         c1, c2 = st.columns([3, 1])
                         with c1:
                             st.markdown(f"#### {row['subject']}")
-                            st.caption(f"申請者: {row['applicant_name']} | 金額: ¥{row['amount']:,} | 申請日: {row['created_at']}")
+                            st.caption(f"申請者: {row['applicant_name']} | 金額: ¥{row['amount']:,} | {row['created_at']}")
                             st.write(row['content'])
+                            
+                            # ★添付ファイルリンク表示★
+                            if row['file_url']:
+                                st.markdown(f"📎 **添付資料:** [{row['file_name']}]({row['file_url']})")
+                            else:
+                                st.caption("（添付資料なし）")
                         
                         with c2:
-                            # 承認ボタン
                             if st.button("承認する", key=f"btn_app_{row['approval_id']}", type="primary"):
-                                # 1. ハンコ画像生成
                                 JST = datetime.timezone(datetime.timedelta(hours=9))
                                 now = datetime.datetime.now(JST)
                                 stamp = create_digital_stamp(stamp_name, now)
                                 stamp_b64 = image_to_base64(stamp)
                                 
-                                # 2. DB更新
                                 with conn.session as s:
                                     s.execute(
                                         text("""
