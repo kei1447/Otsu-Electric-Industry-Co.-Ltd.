@@ -8,7 +8,6 @@ STAMP_SIZE = 120
 STAMP_COLOR = (220, 50, 50) # 朱色
 
 # ★ここにアップロードしたフォントファイル名を正確に入力してください★
-# ※もしファイル名が違う場合は書き換えてください
 FONT_FILENAME = "ShipporiMincho-Bold.ttf" 
 
 def get_font_path():
@@ -22,13 +21,12 @@ def get_font_path():
     elif os.path.exists(path3): return path3
     else: return None
 
-def create_digital_stamp(name_text, date_text):
+def create_digital_stamp(name_text, datetime_obj):
     """
-    電子印鑑生成（デザイン調整版）
-    - 上段：承認（大きく）
-    - 中段：日付（少し大きく）
-    - 下段：名前（3文字対応・自動縮小）
-    - 配置：完全中央揃え
+    電子印鑑生成（日時・秒対応版）
+    - 上段：承認
+    - 中段：YYYY/MM/DD (改行) HH:MM:SS
+    - 下段：名前（3文字対応）
     """
     # 1. キャンバス作成
     img = Image.new('RGBA', (STAMP_SIZE, STAMP_SIZE), (255, 255, 255, 0))
@@ -42,65 +40,66 @@ def create_digital_stamp(name_text, date_text):
         width=3
     )
     
-    # 3. 区切り線の位置定義（全体のバランス調整）
-    # 上段(承認)エリア: 0% ～ 36%
-    # 中段(日付)エリア: 36% ～ 64%
-    # 下段(名前)エリア: 64% ～ 100%
-    line_y1 = int(STAMP_SIZE * 0.36)
-    line_y2 = int(STAMP_SIZE * 0.64)
+    # 3. 区切り線の位置定義
+    # 2行入れるため、中段エリアをわずかに広げます (36-64% -> 34-66%)
+    line_y1 = int(STAMP_SIZE * 0.34)
+    line_y2 = int(STAMP_SIZE * 0.66)
     
-    # 線を描画
-    padding = 12 # 線の左右の余白
+    padding = 12
     draw.line((padding, line_y1, STAMP_SIZE - padding, line_y1), fill=STAMP_COLOR, width=2)
     draw.line((padding, line_y2, STAMP_SIZE - padding, line_y2), fill=STAMP_COLOR, width=2)
 
-    # 4. フォント読み込みとサイズ設定
+    # 4. フォント設定
     font_path = get_font_path()
-    
     if not font_path:
         st.error(f"フォントファイル '{FONT_FILENAME}' が見つかりません。")
         return img
 
     try:
-        # --- 文字サイズの調整 ---
-        
-        # 上段「承認」: 大きくドシッと
+        # 上段「承認」
         size_top = 22 
         font_top = ImageFont.truetype(font_path, size_top)
 
-        # 中段「日付」: 少し大きく見やすく
-        size_date = 15 
+        # 中段「日時」: 2行にするため小さく設定 (11pt)
+        size_date = 11
         font_date = ImageFont.truetype(font_path, size_date)
 
-        # 下段「名前」: 文字数によってサイズを自動変更
+        # 下段「名前」
         if len(name_text) >= 3:
-            size_name = 18 # 3文字以上なら少し小さくして収める
+            size_name = 18
         else:
-            size_name = 24 # 2文字以下なら大きく
+            size_name = 24
         font_name = ImageFont.truetype(font_path, size_name)
 
     except Exception as e:
         st.error(f"フォント読み込みエラー: {e}")
         return img
 
-    # 5. 文字の描画（完全中央揃えロジック）
-    # anchor="mm" (Middle-Middle) を使うと、指定した座標が文字の中心になります
+    # 5. 文字の描画
     
     # --- 上段：「承認」 ---
-    # エリアの中心Y座標 = (0 + line_y1) / 2
     center_y_top = line_y1 / 2
     draw.text((STAMP_SIZE / 2, center_y_top), "承認", font=font_top, fill=STAMP_COLOR, anchor="mm")
 
-    # --- 中段：日付 ---
-    # エリアの中心Y座標 = (line_y1 + line_y2) / 2
+    # --- 中段：日時 (2行) ---
+    # フォーマット: YYYY/MM/DD \n HH:MM:SS
+    date_str = datetime_obj.strftime("%Y/%m/%d\n%H:%M:%S")
+    
     center_y_date = (line_y1 + line_y2) / 2
-    # 少しだけ上に補正（フォントのベースライン調整）
-    draw.text((STAMP_SIZE / 2, center_y_date - 1), date_text, font=font_date, fill=STAMP_COLOR, anchor="mm")
+    # multiline_textで描画 (align='center' と anchor='mm' を組み合わせる)
+    # spacing=1 で行間を詰めます
+    draw.multiline_text(
+        (STAMP_SIZE / 2, center_y_date), 
+        date_str, 
+        font=font_date, 
+        fill=STAMP_COLOR, 
+        anchor="mm", 
+        align="center", 
+        spacing=1
+    )
 
     # --- 下段：名前 ---
-    # エリアの中心Y座標 = (line_y2 + STAMP_SIZE) / 2
     center_y_name = (line_y2 + STAMP_SIZE) / 2
-    # 円の下部にぶつからないよう少し上に補正
     draw.text((STAMP_SIZE / 2, center_y_name - 2), name_text, font=font_name, fill=STAMP_COLOR, anchor="mm")
 
     return img
@@ -112,18 +111,18 @@ col1, col2 = st.columns(2)
 
 with col1:
     st.subheader("承認アクション")
-    # デフォルトを3文字ネームにしてテストしやすくしました
-    approver_name = st.text_input("承認者名（名字）", "佐々木")
+    approver_name = st.text_input("承認者名（名字）", "日比野")
     
-    today = datetime.date.today()
-    date_str = f"{today.year-2000}.{today.month:02}.{today.day:02}"
-    
-    if st.button("承認する（ハンコ生成）"):
-        stamp_img = create_digital_stamp(approver_name, date_str)
+    # 承認ボタン
+    if st.button("承認する（現在時刻で捺印）"):
+        # ボタンを押した瞬間の日時を取得
+        now = datetime.datetime.now()
+        
+        stamp_img = create_digital_stamp(approver_name, now)
         st.session_state["demo_stamp"] = stamp_img
         
         if get_font_path():
-            st.success("電子印影を生成しました！")
+            st.success(f"承認完了: {now.strftime('%H:%M:%S')}")
 
 with col2:
     st.subheader("プレビュー")
