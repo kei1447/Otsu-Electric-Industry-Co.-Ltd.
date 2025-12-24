@@ -4,6 +4,7 @@ from sqlalchemy import text
 import datetime
 import uuid
 import os
+import json
 from supabase import create_client
 
 # --- 設定 ---
@@ -32,7 +33,6 @@ def upload_file_to_storage(uploaded_file):
         return None, None
 
 def send_email_notification(to_email, subject, body):
-    # シミュレーション通知
     st.toast(f"📩 (Mail Simulation) To: {to_email} | {subject}")
 
 # --- メイン処理 ---
@@ -68,7 +68,7 @@ def main():
         # 自分の申請分
         sql_my_app = f"SELECT ringi_id, created_at, subject, amount, status, applicant_name, '申請分' as type FROM T_Ringi_Header WHERE applicant_email = '{my_email}'"
         
-        # 自分への承認待ち (IDで個人指定されたもの)
+        # 自分への承認待ち
         sql_to_approve = f"""
             UNION ALL
             SELECT h.ringi_id, h.created_at, h.subject, h.amount, '承認待ち' as status, h.applicant_name, '承認待' as type
@@ -92,7 +92,9 @@ def main():
                 
                 selected_id = st.selectbox("案件詳細を確認", df_view["ringi_id"], index=None)
                 if selected_id:
-                    row = df_view[df_view["ringi_id"] == selected_id].iloc[0]
+                    # 詳細データ取得（custom_data含む）
+                    row = conn.query(f"SELECT * FROM T_Ringi_Header WHERE ringi_id = {selected_id}", ttl=0).iloc[0]
+                    
                     with st.container(border=True):
                         st.subheader(f"{row['subject']}")
                         if row["status"] == "下書き":
@@ -101,35 +103,55 @@ def main():
                                 st.session_state["page_mode"] = "edit"
                                 st.rerun()
                         else:
-                            st.write(f"**現在のステータス:** {row['status']}")
+                            st.write(f"**ステータス:** {row['status']}")
                             
-                            # フロー状況表示
-                            st.markdown("###### 承認・回付履歴")
-                            steps = conn.query(f"SELECT step_order, approver_role, approver_name, status, comment, approved_at FROM T_Ringi_Approvals WHERE ringi_id = {selected_id} ORDER BY step_order", ttl=0)
-                            
-                            for idx, s_row in steps.iterrows():
-                                icon = "⬜"
-                                if s_row['status'] == '承認': icon = "✅"
-                                elif s_row['status'] == '却下': icon = "❌"
-                                elif s_row['status'] == '未承認': icon = "⏳"
+                            # ★カスタムデータの表示★
+                            if row['custom_data']:
+                                st.markdown("---")
+                                st.caption("申請詳細:")
+                                c_data = row['custom_data']
+                                # JSONが文字列で入っている場合の対策
+                                if isinstance(c_data, str):
+                                    c_data = json.loads(c_data)
                                 
-                                st.markdown(f"**{s_row['step_order']}. {icon} {s_row['approver_name']} ({s_row['approver_role']})** : {s_row['status']}")
-                                if s_row['comment']:
-                                    st.info(f"💬 {s_row['comment']}")
+                                # 辞書の中身をきれいに表示
+                                for k, v in c_data.items():
+                                    st.write(f"**{k}:** {v}")
+                            else:
+                                # 従来の内容表示
+                                st.write(f"**内容:** {row['content']}")
+
+                            st.markdown("---")
+                            # フロー状況表示
+                            steps = conn.query(f"SELECT step_order, approver_role, approver_name, status, comment FROM T_Ringi_Approvals WHERE ringi_id = {selected_id} ORDER BY step_order", ttl=0)
+                            for idx, s_row in steps.iterrows():
+                                icon = "✅" if s_row['status'] == '承認' else ("❌" if s_row['status'] == '却下' else "⏳")
+                                st.write(f"{icon} {s_row['approver_name']} ({s_row['status']})")
+                                if s_row['comment']: st.info(f"💬 {s_row['comment']}")
 
         with tab2:
             df_app = df_list[df_list['type'] == '承認待']
             if df_app.empty:
-                st.info("あなた宛ての承認依頼はありません")
+                st.info("承認依頼はありません")
             else:
                 for i, row in df_app.iterrows():
                     with st.container(border=True):
                         st.markdown(f"**No.{row['ringi_id']} {row['subject']}**")
                         st.write(f"申請者: {row['applicant_name']} | ¥{row['amount']:,}")
                         
-                        detail = conn.query(f"SELECT content FROM T_Ringi_Header WHERE ringi_id={row['ringi_id']}", ttl=0).iloc[0]
-                        with st.expander("詳細を見る"):
-                            st.text(detail['content'])
+                        # 詳細取得
+                        detail_row = conn.query(f"SELECT * FROM T_Ringi_Header WHERE ringi_id={row['ringi_id']}", ttl=0).iloc[0]
+                        
+                        with st.expander("申請内容の詳細を見る"):
+                            # ★カスタムデータがあればそれを表示★
+                            if detail_row['custom_data']:
+                                c_data = detail_row['custom_data']
+                                if isinstance(c_data, str): c_data = json.loads(c_data)
+                                for k, v in c_data.items():
+                                    st.write(f"**{k}:** {v}")
+                            else:
+                                st.text(detail_row['content'])
+                                
                             files = conn.query(f"SELECT file_name, file_url FROM T_Ringi_Attachments WHERE ringi_id = {row['ringi_id']}", ttl=0)
                             for _, f in files.iterrows():
                                 st.markdown(f"📎 [{f['file_name']}]({f['file_url']})")
@@ -145,14 +167,10 @@ def main():
                                         text("UPDATE T_Ringi_Approvals SET status='承認', approved_at=:at, comment=:cm WHERE ringi_id=:rid AND approver_id=:uid"),
                                         {"at": now, "cm": comment, "rid": row['ringi_id'], "uid": my_email}
                                     )
-                                    # 全員の承認が終わったかチェック
-                                    # (簡易判定: 未承認が0件になれば完了)
-                                    pending_count = s.execute(text(f"SELECT count(*) FROM T_Ringi_Approvals WHERE ringi_id={row['ringi_id']} AND status='未承認'")).fetchone()[0]
-                                    if pending_count == 0:
+                                    pending = s.execute(text(f"SELECT count(*) FROM T_Ringi_Approvals WHERE ringi_id={row['ringi_id']} AND status='未承認'")).fetchone()[0]
+                                    if pending == 0:
                                         s.execute(text("UPDATE T_Ringi_Header SET status='決裁完了' WHERE ringi_id=:rid"), {"rid": row['ringi_id']})
-                                    
                                     s.commit()
-                                
                                 send_email_notification("applicant@example.com", f"【承認】{row['subject']}", f"{my_name}が承認しました。")
                                 st.success("承認しました")
                                 st.rerun()
@@ -170,49 +188,118 @@ def main():
                                  st.rerun()
 
     # ==================================================
-    # モードB: 編集画面
+    # モードB: 編集画面 (テンプレート対応版)
     # ==================================================
     elif st.session_state["page_mode"] == "edit":
         edit_id = st.session_state.get("editing_ringi_id")
         is_new = edit_id is None
-        st.subheader("📝 稟議書作成" if is_new else "✏️ 稟議書編集")
+        st.subheader("📝 稟議・申請作成")
         
+        # --- 1. テンプレート選択 ---
+        # 登録済みのテンプレートを取得
+        templates_df = conn.query("SELECT * FROM M_Templates ORDER BY template_id", ttl=60)
+        template_options = {row['template_name']: row for i, row in templates_df.iterrows()}
+        
+        # 初期値ロード
         default_subject = ""
         default_amount = 0
         default_content = ""
-        default_approvers_indices = [] # 編集時の承認者再現は少し複雑なため今回は初期値のみ対応
-        
-        # ユーザーマスタから承認者リストを取得
-        users_df = conn.query("SELECT display_name, role, user_id FROM M_Users ORDER BY role DESC", ttl=60)
-        # 表示用リスト: "山田 太郎 (課長)"
-        user_options = [f"{row['display_name']} ({row['role']})" for i, row in users_df.iterrows()]
-        # 保存用リスト: メールアドレス
-        user_ids = users_df['user_id'].tolist()
-        
+        selected_template_name = None
+        loaded_custom_data = {}
+
         if not is_new:
+            # 既存データ読み込み
             existing = conn.query(f"SELECT * FROM T_Ringi_Header WHERE ringi_id = {edit_id}", ttl=0).iloc[0]
             default_subject = existing["subject"]
             default_amount = existing["amount"]
             default_content = existing["content"]
-            # 既に設定されたルートがあれば読み込む処理が必要だが、今回はシンプル化のためスキップ
+            
+            # テンプレート情報の復元
+            if existing['template_id']:
+                temp_row = templates_df[templates_df['template_id'] == existing['template_id']]
+                if not temp_row.empty:
+                    selected_template_name = temp_row.iloc[0]['template_name']
+            
+            # カスタムデータの復元
+            if existing['custom_data']:
+                loaded_custom_data = existing['custom_data']
+                if isinstance(loaded_custom_data, str):
+                    loaded_custom_data = json.loads(loaded_custom_data)
+
+        # テンプレート選択UI
+        # (新規作成時、または既存データにテンプレートがある場合)
+        template_name = st.selectbox(
+            "申請書の種類 (テンプレート)", 
+            options=["標準稟議書"] + list(template_options.keys()),
+            index=0 if not selected_template_name else (["標準稟議書"] + list(template_options.keys())).index(selected_template_name)
+        )
 
         with st.form("ringi_form"):
+            # 共通ヘッダー項目
             subject = st.text_input("件名", value=default_subject)
-            amount = st.number_input("金額 (円)", value=default_amount, step=1000)
-            content = st.text_area("内容", value=default_content, height=150)
-            uploaded_files = st.file_uploader("添付ファイル追加", accept_multiple_files=True)
+            amount = st.number_input("金額 (円) ※予算管理用", value=default_amount, step=1000)
             
+            # --- 2. 可変フォーム生成 ---
+            custom_values = {} # ここに入力データを詰める
+            selected_template_id = None
+            
+            if template_name == "標準稟議書":
+                # 従来通りのテキストエリア
+                content = st.text_area("内容・理由", value=default_content, height=150)
+            else:
+                # ★テンプレート展開ロジック★
+                st.info(f"📋 {template_name} の入力フォーム")
+                content = "" # 標準内容は使わないので空に
+                
+                # 選択されたテンプレの設計図(JSON)を取得
+                target_temp = template_options[template_name]
+                selected_template_id = int(target_temp['template_id'])
+                schema = target_temp['schema_json']
+                if isinstance(schema, str): schema = json.loads(schema)
+                
+                # 設計図に基づいてウィジェットをループ生成
+                for field in schema:
+                    label = field['label']
+                    typ = field['type']
+                    # 編集時は既存の値を初期値にする
+                    init_val = loaded_custom_data.get(label, "")
+                    
+                    if typ == "text":
+                        val = st.text_input(label, value=str(init_val))
+                    elif typ == "number":
+                        val = st.number_input(label, value=int(init_val) if init_val else 0)
+                    elif typ == "date":
+                        # 日付変換処理
+                        d_val = None
+                        if init_val:
+                            try: d_val = pd.to_datetime(init_val).date()
+                            except: pass
+                        val = st.date_input(label, value=d_val)
+                    elif typ == "textarea":
+                        val = st.text_area(label, value=str(init_val))
+                    elif typ == "select":
+                        opts = field.get('options', [])
+                        idx = opts.index(init_val) if init_val in opts else 0
+                        val = st.selectbox(label, opts, index=idx)
+                    elif typ == "checkbox":
+                        val = st.checkbox(label, value=bool(init_val))
+                    
+                    # 辞書に格納 (日付などは文字列化しておくとJSON保存が楽)
+                    if isinstance(val, (datetime.date, datetime.datetime)):
+                        custom_values[label] = str(val)
+                    else:
+                        custom_values[label] = val
+
             st.markdown("---")
+            uploaded_files = st.file_uploader("添付ファイル", accept_multiple_files=True)
+            
             st.write("▼ 承認ルート設定")
-            st.caption("承認してほしい順番に選択してください。上から順に承認フローが回ります。")
+            users_df = conn.query("SELECT display_name, role, user_id FROM M_Users ORDER BY role DESC", ttl=60)
+            user_options = [f"{row['display_name']} ({row['role']})" for i, row in users_df.iterrows()]
+            user_ids = users_df['user_id'].tolist()
             
-            # ★ルート選択機能★
-            selected_approvers = st.multiselect(
-                "承認者を選択",
-                options=user_options,
-                default=[] # デフォルトは空、必要に応じて["日比野 (課長)", ...]のようにセット可
-            )
-            
+            selected_approvers = st.multiselect("承認者を選択", options=user_options)
+
             c1, c2, c3 = st.columns(3)
             with c1:
                 if st.form_submit_button("キャンセル"):
@@ -220,70 +307,64 @@ def main():
                     st.rerun()
             with c2:
                 if st.form_submit_button("下書き保存"):
-                    # 下書き時はルート保存しなくてもOK
-                    save_header_only(conn, is_new, edit_id, my_name, my_email, subject, amount, content, "下書き", uploaded_files)
-                    st.toast("下書き保存しました")
+                    save_data(conn, is_new, edit_id, my_name, my_email, subject, amount, content, "下書き", uploaded_files, [], selected_template_id, custom_values)
+                    st.toast("保存しました")
                     st.session_state["page_mode"] = "list"
                     st.rerun()
             with c3:
                 if st.form_submit_button("申請する", type="primary"):
-                    if not subject:
-                        st.warning("件名は必須です")
-                    elif not selected_approvers:
-                        st.warning("承認ルートを設定してください")
+                    if not subject: st.warning("件名は必須です")
+                    elif not selected_approvers: st.warning("承認ルートを設定してください")
                     else:
-                        # 選択された表示名から、ユーザー情報を復元して保存
-                        approver_data_list = []
+                        approver_data = []
                         for sel in selected_approvers:
                             idx = user_options.index(sel)
-                            approver_data_list.append({
-                                "id": user_ids[idx],
-                                "name": users_df.iloc[idx]['display_name'],
-                                "role": users_df.iloc[idx]['role']
-                            })
+                            approver_data.append({"id": user_ids[idx], "name": users_df.iloc[idx]['display_name'], "role": users_df.iloc[idx]['role']})
                         
-                        save_full_data(conn, is_new, edit_id, my_name, my_email, subject, amount, content, "申請中", uploaded_files, approver_data_list)
-                        send_email_notification(approver_data_list[0]['id'], f"【承認依頼】{subject}", f"{my_name}から申請がありました。")
+                        save_data(conn, is_new, edit_id, my_name, my_email, subject, amount, content, "申請中", uploaded_files, approver_data, selected_template_id, custom_values)
+                        send_email_notification(approver_data[0]['id'], subject, "承認依頼")
                         st.success("申請しました！")
                         st.session_state["page_mode"] = "list"
                         st.rerun()
 
-def save_header_only(conn, is_new, ringi_id, name, email, subject, amount, content, status, files):
-    """下書き用: ルート未定でも保存可能"""
-    save_full_data(conn, is_new, ringi_id, name, email, subject, amount, content, status, files, [])
-
-def save_full_data(conn, is_new, ringi_id, name, email, subject, amount, content, status, files, approver_list):
-    """申請用: ルート情報込みで保存"""
+def save_data(conn, is_new, ringi_id, name, email, subject, amount, content, status, files, approver_list, template_id, custom_data):
+    """保存処理（カスタムデータ対応版）"""
     with conn.session as s:
         target_id = ringi_id
-        # 1. Header保存
+        # custom_data (dict) をJSON文字列に変換
+        json_str = json.dumps(custom_data, ensure_ascii=False) if custom_data else None
+        
         if is_new:
-            row = s.execute(text("INSERT INTO T_Ringi_Header (applicant_name, applicant_email, subject, amount, content, status) VALUES (:nm, :em, :sub, :amt, :cnt, :st) RETURNING ringi_id"),
-                            {"nm": name, "em": email, "sub": subject, "amt": amount, "cnt": content, "st": status}).fetchone()
+            row = s.execute(
+                text("""
+                INSERT INTO T_Ringi_Header 
+                (applicant_name, applicant_email, subject, amount, content, status, template_id, custom_data) 
+                VALUES (:nm, :em, :sub, :amt, :cnt, :st, :tid, :cdata) 
+                RETURNING ringi_id
+                """),
+                {"nm": name, "em": email, "sub": subject, "amt": amount, "cnt": content, "st": status, "tid": template_id, "cdata": json_str}
+            ).fetchone()
             target_id = row[0]
         else:
-            s.execute(text("UPDATE T_Ringi_Header SET subject=:sub, amount=:amt, content=:cnt, status=:st WHERE ringi_id=:rid"),
-                      {"sub": subject, "amt": amount, "cnt": content, "st": status, "rid": ringi_id})
+            s.execute(
+                text("""
+                UPDATE T_Ringi_Header 
+                SET subject=:sub, amount=:amt, content=:cnt, status=:st, template_id=:tid, custom_data=:cdata
+                WHERE ringi_id=:rid
+                """),
+                {"sub": subject, "amt": amount, "cnt": content, "st": status, "tid": template_id, "cdata": json_str, "rid": ringi_id}
+            )
         
-        # 2. ファイル保存
         if files:
             for f in files:
                 f_url, f_name = upload_file_to_storage(f)
                 if f_url: s.execute(text("INSERT INTO T_Ringi_Attachments (ringi_id, file_name, file_url) VALUES (:rid, :fn, :fu)"), {"rid": target_id, "fn": f_name, "fu": f_url})
 
-        # 3. ルート保存 (申請時のみ)
         if status == "申請中" and approver_list:
-            # 既存ルート削除（上書き）
             s.execute(text(f"DELETE FROM T_Ringi_Approvals WHERE ringi_id={target_id}"))
-            # 新規ルート登録
             for i, user in enumerate(approver_list):
-                s.execute(
-                    text("""
-                    INSERT INTO T_Ringi_Approvals (ringi_id, step_order, approver_id, approver_name, approver_role) 
-                    VALUES (:rid, :ord, :uid, :nm, :role)
-                    """),
-                    {"rid": target_id, "ord": i+1, "uid": user['id'], "nm": user['name'], "role": user['role']}
-                )
+                s.execute(text("INSERT INTO T_Ringi_Approvals (ringi_id, step_order, approver_id, approver_name, approver_role) VALUES (:rid, :ord, :uid, :nm, :role)"),
+                          {"rid": target_id, "ord": i+1, "uid": user['id'], "nm": user['name'], "role": user['role']})
         s.commit()
 
 if __name__ == "__main__":
