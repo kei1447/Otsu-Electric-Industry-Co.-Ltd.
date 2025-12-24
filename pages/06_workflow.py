@@ -52,7 +52,6 @@ def main():
     if st.button("＋ 新規起案", type="primary", use_container_width=True):
         st.session_state["editing_ringi_id"] = None
         st.session_state["page_mode"] = "edit"
-        # ルートビルダー用の初期化
         st.session_state["draft_route"] = [] 
         st.rerun()
 
@@ -62,10 +61,12 @@ def main():
         st.session_state["page_mode"] = "list"
 
     # ==================================================
-    # モードA: 一覧画面 (前回と同じ)
+    # モードA: 一覧画面
     # ==================================================
     if st.session_state["page_mode"] == "list":
+        # 起案分（ステータス：下書き、差戻しも含む）
         sql_my_app = f"SELECT ringi_id, created_at, subject, amount, status, applicant_name, '起案分' as type FROM T_Ringi_Header WHERE applicant_email = '{my_email}'"
+        # 受信トレイ
         sql_to_approve = f"""
             UNION ALL
             SELECT h.ringi_id, h.created_at, h.subject, h.amount, '確認・承認待ち' as status, h.applicant_name, '受信トレイ' as type
@@ -88,20 +89,19 @@ def main():
                     row = conn.query(f"SELECT * FROM T_Ringi_Header WHERE ringi_id = {selected_id}", ttl=0).iloc[0]
                     with st.container(border=True):
                         st.subheader(f"{row['subject']}")
-                        if row["status"] == "下書き":
-                            if st.button("✏️ 編集・回付する"):
+                        
+                        # 下書き or 差戻し の場合は再編集ボタンを表示
+                        if row["status"] in ["下書き", "差戻し"]:
+                            msg = "下書き編集中" if row["status"] == "下書き" else "⚠️ 差戻し案件です。内容を修正して再提出してください。"
+                            st.warning(msg)
+                            if st.button("✏️ 編集・再提出する"):
                                 st.session_state["editing_ringi_id"] = selected_id
                                 st.session_state["page_mode"] = "edit"
-                                # 既存ルートの復元ロジックが必要だが、今回は簡易的に空リセットまたはDBから再取得
-                                # DBからルートを読み込んで draft_route に入れる
+                                # ルート復元
                                 existing_route = conn.query(f"SELECT approver_id, approver_name, approver_role FROM T_Ringi_Approvals WHERE ringi_id={selected_id} ORDER BY step_order", ttl=0)
                                 restored_route = []
                                 for _, r_row in existing_route.iterrows():
-                                    restored_route.append({
-                                        "id": r_row['approver_id'], 
-                                        "name": r_row['approver_name'], 
-                                        "role": r_row['approver_role']
-                                    })
+                                    restored_route.append({"id": r_row['approver_id'], "name": r_row['approver_name'], "role": r_row['approver_role']})
                                 st.session_state["draft_route"] = restored_route
                                 st.rerun()
                         else:
@@ -116,20 +116,22 @@ def main():
                             else:
                                 st.write(f"**内容:** {row['content']}")
                             st.markdown("---")
+                            # 履歴表示（差戻しコメントなども見えるように）
                             steps = conn.query(f"SELECT step_order, approver_role, approver_name, status, comment FROM T_Ringi_Approvals WHERE ringi_id = {selected_id} ORDER BY step_order", ttl=0)
                             for idx, s_row in steps.iterrows():
-                                icon = "✅" if s_row['status'] == '承認' else ("❌" if s_row['status'] == '却下' else "⏳")
+                                icon = "✅" if s_row['status'] == '承認' else ("↩️" if s_row['status'] == '差戻し' else ("❌" if s_row['status'] == '却下' else "⏳"))
                                 st.write(f"{icon} {s_row['approver_name']} ({s_row['status']})")
                                 if s_row['comment']: st.info(f"💬 {s_row['comment']}")
 
         with tab2:
             df_app = df_list[df_list['type'] == '受信トレイ']
-            if df_app.empty: st.info("現在、あなたへの回付案件はありません")
+            if df_app.empty: st.info("承認待ち案件はありません")
             else:
                 for i, row in df_app.iterrows():
                     with st.container(border=True):
                         st.markdown(f"**No.{row['ringi_id']} {row['subject']}**")
                         st.caption(f"起案者: {row['applicant_name']}")
+                        
                         detail_row = conn.query(f"SELECT * FROM T_Ringi_Header WHERE ringi_id={row['ringi_id']}", ttl=0).iloc[0]
                         with st.expander("詳細を見る"):
                             if detail_row.get('phase') and detail_row.get('phase') != 'None':
@@ -143,41 +145,124 @@ def main():
                             files = conn.query(f"SELECT file_name, file_url FROM T_Ringi_Attachments WHERE ringi_id = {row['ringi_id']}", ttl=0)
                             for _, f in files.iterrows(): st.markdown(f"📎 [{f['file_name']}]({f['file_url']})")
                         
-                        comment = st.text_input("💬 コメント", key=f"cmt_{row['ringi_id']}")
+                        # --- ★ルート変更機能 (承認者による介入) ---
+                        with st.expander("⚙️ 承認ルートの確認・変更（次の回付先を追加できます）"):
+                            # 未来のステップ（自分より後のステップ）を取得
+                            current_step_df = conn.query(f"SELECT step_order FROM T_Ringi_Approvals WHERE ringi_id={row['ringi_id']} AND approver_id='{my_email}'", ttl=0)
+                            if not current_step_df.empty:
+                                current_step_order = current_step_df.iloc[0]['step_order']
+                                # 自分より後のルートを取得
+                                future_steps = conn.query(f"SELECT approval_id, approver_name, approver_role, approver_id FROM T_Ringi_Approvals WHERE ringi_id={row['ringi_id']} AND step_order > {current_step_order} ORDER BY step_order", ttl=0)
+                                
+                                # SessionStateで管理するためのキー
+                                future_route_key = f"future_route_{row['ringi_id']}"
+                                if future_route_key not in st.session_state:
+                                    st.session_state[future_route_key] = []
+                                    for _, fs in future_steps.iterrows():
+                                        st.session_state[future_route_key].append({
+                                            "id": fs['approver_id'], "name": fs['approver_name'], "role": fs['approver_role']
+                                        })
+
+                                # ルート編集UI
+                                st.caption("▼ 現在予定されている後続のルート")
+                                current_future = st.session_state[future_route_key]
+                                
+                                # 追加用UI
+                                users_df = conn.query("SELECT display_name, role, user_id FROM M_Users ORDER BY role DESC", ttl=60)
+                                u_opts = {f"{r['display_name']} ({r['role']})": r for _, r in users_df.iterrows()}
+                                add_u = st.selectbox("承認者を追加", list(u_opts.keys()), key=f"add_sel_{row['ringi_id']}")
+                                if st.button("最後尾に追加", key=f"add_btn_{row['ringi_id']}"):
+                                    u_data = u_opts[add_u]
+                                    st.session_state[future_route_key].append({"id": u_data['user_id'], "name": u_data['display_name'], "role": u_data['role']})
+                                    st.rerun()
+
+                                # リスト表示
+                                if not current_future:
+                                    st.info("後続の承認者はいません（あなたが最終決裁者です）。必要であれば追加してください。")
+                                else:
+                                    for idx, fr in enumerate(current_future):
+                                        fc1, fc2, fc3 = st.columns([0.5, 4, 1])
+                                        with fc1: st.write(f"次+{idx+1}")
+                                        with fc2: st.write(f"**{fr['name']}** ({fr['role']})")
+                                        with fc3: 
+                                            if st.button("削除", key=f"del_f_{row['ringi_id']}_{idx}"):
+                                                st.session_state[future_route_key].pop(idx)
+                                                st.rerun()
+
+                        # 承認アクション
+                        comment = st.text_input("💬 コメント / 申し送り事項", key=f"cmt_{row['ringi_id']}")
                         c_a, c_b = st.columns(2)
+                        
                         with c_a:
-                            if st.button("承認 / 確認済", key=f"app_{row['ringi_id']}", type="primary", use_container_width=True):
+                            if st.button("承認 / 回付", key=f"app_{row['ringi_id']}", type="primary", use_container_width=True):
                                 with conn.session as s:
                                     now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
-                                    s.execute(text("UPDATE T_Ringi_Approvals SET status='承認', approved_at=:at, comment=:cm WHERE ringi_id=:rid AND approver_id=:uid"), {"at": now, "cm": comment, "rid": row['ringi_id'], "uid": my_email})
+                                    
+                                    # 1. 自分のステータスを承認にする
+                                    s.execute(text("UPDATE T_Ringi_Approvals SET status='承認', approved_at=:at, comment=:cm WHERE ringi_id=:rid AND approver_id=:uid"), 
+                                              {"at": now, "cm": comment, "rid": row['ringi_id'], "uid": my_email})
+                                    
+                                    # 2. ★ルート変更の反映★
+                                    # 自分より後のステップを一旦全削除し、編集後のリストで再登録する
+                                    current_step_df = conn.query(f"SELECT step_order FROM T_Ringi_Approvals WHERE ringi_id={row['ringi_id']} AND approver_id='{my_email}'", ttl=0)
+                                    cur_step = current_step_df.iloc[0]['step_order']
+                                    
+                                    # 後続削除
+                                    s.execute(text(f"DELETE FROM T_Ringi_Approvals WHERE ringi_id={row['ringi_id']} AND step_order > {cur_step}"))
+                                    
+                                    # 新ルート登録
+                                    future_route_key = f"future_route_{row['ringi_id']}"
+                                    if future_route_key in st.session_state:
+                                        new_route = st.session_state[future_route_key]
+                                        for i, usr in enumerate(new_route):
+                                            s.execute(text("""
+                                                INSERT INTO T_Ringi_Approvals (ringi_id, step_order, approver_id, approver_name, approver_role)
+                                                VALUES (:rid, :ord, :uid, :nm, :role)
+                                            """), {"rid": row['ringi_id'], "ord": cur_step + 1 + i, "uid": usr['id'], "nm": usr['name'], "role": usr['role']})
+                                        
+                                        # メモリ解放
+                                        del st.session_state[future_route_key]
+
+                                    # 3. 完了判定（後続がいなければ完了）
                                     pending = s.execute(text(f"SELECT count(*) FROM T_Ringi_Approvals WHERE ringi_id={row['ringi_id']} AND status='未承認'")).fetchone()[0]
-                                    if pending == 0: s.execute(text("UPDATE T_Ringi_Header SET status='決裁完了' WHERE ringi_id=:rid"), {"rid": row['ringi_id']})
+                                    if pending == 0:
+                                        s.execute(text("UPDATE T_Ringi_Header SET status='決裁完了' WHERE ringi_id=:rid"), {"rid": row['ringi_id']})
+                                    
                                     s.commit()
-                                send_email_notification("applicant@example.com", f"【完了】{row['subject']}", f"{my_name}が確認しました。")
-                                st.success("処理しました")
+                                
+                                send_email_notification("next@example.com", f"【承認・回付】{row['subject']}", f"{my_name}が承認しました。")
+                                st.success("承認し、次のステップへ回しました")
                                 st.rerun()
+
                         with c_b:
-                            if st.button("差戻し / 却下", key=f"rej_{row['ringi_id']}", use_container_width=True):
+                            # ★差戻し機能の実装
+                            if st.button("差戻し (修正依頼)", key=f"remand_{row['ringi_id']}", use_container_width=True):
                                  with conn.session as s:
-                                    s.execute(text("UPDATE T_Ringi_Approvals SET status='却下', approved_at=:at, comment=:cm WHERE ringi_id=:rid AND approver_id=:uid"), {"at": datetime.datetime.now(), "cm": comment, "rid": row['ringi_id'], "uid": my_email})
-                                    s.execute(text("UPDATE T_Ringi_Header SET status='却下' WHERE ringi_id=:rid"), {"rid": row['ringi_id']})
+                                    # 自分の承認レコードを「差戻し」にする
+                                    s.execute(text("UPDATE T_Ringi_Approvals SET status='差戻し', approved_at=:at, comment=:cm WHERE ringi_id=:rid AND approver_id=:uid"), 
+                                              {"at": datetime.datetime.now(), "cm": comment, "rid": row['ringi_id'], "uid": my_email})
+                                    # ヘッダーのステータスも「差戻し」にする（これで申請者が編集可能になる）
+                                    s.execute(text("UPDATE T_Ringi_Header SET status='差戻し' WHERE ringi_id=:rid"), {"rid": row['ringi_id']})
                                     s.commit()
-                                 send_email_notification("applicant@example.com", f"【差戻】{row['subject']}", f"理由: {comment}")
-                                 st.error("差し戻しました")
+                                 
+                                 send_email_notification("applicant@example.com", f"【差戻】{row['subject']}", f"修正依頼: {comment}")
+                                 st.warning("申請者に差し戻しました")
                                  st.rerun()
 
     # ==================================================
-    # モードB: 編集・起案画面
+    # モードB: 編集・起案画面 (前回と同じだが、再提出対応)
     # ==================================================
     elif st.session_state["page_mode"] == "edit":
         edit_id = st.session_state.get("editing_ringi_id")
         is_new = edit_id is None
-        st.subheader("📝 新規起案" if is_new else "✏️ 案件編集")
+        
+        # タイトル変更（差戻し対応）
+        page_title = "📝 新規起案" if is_new else "✏️ 案件編集・再提出"
+        st.subheader(page_title)
         
         templates_df = conn.query("SELECT * FROM M_Templates ORDER BY template_id", ttl=60)
         template_options = {row['template_name']: row for i, row in templates_df.iterrows()}
         
-        # 初期値
         default_subject = ""
         default_amount = 0
         default_content = ""
@@ -201,25 +286,19 @@ def main():
             if existing['custom_data']:
                 loaded_custom_data = existing['custom_data']
                 if isinstance(loaded_custom_data, str): loaded_custom_data = json.loads(loaded_custom_data)
-
-        # テンプレート選択
-        template_name = st.selectbox(
-            "案件の種類", 
-            options=["標準フォーマット"] + list(template_options.keys()),
-            index=0 if not selected_template_name else (["標準フォーマット"] + list(template_options.keys())).index(selected_template_name)
-        )
+        
+        template_name = st.selectbox("案件の種類", options=["標準フォーマット"] + list(template_options.keys()), index=0 if not selected_template_name else (["標準フォーマット"] + list(template_options.keys())).index(selected_template_name))
         is_standard = (template_name == "標準フォーマット")
 
         with st.form("ringi_form"):
             st.markdown("##### 1. 基本情報")
-            subject = st.text_input("件名", value=default_subject, placeholder="例: ○○に関する報告、××購入の件")
+            subject = st.text_input("件名", value=default_subject)
             
             fiscal_year = None
             budget_cat = None
             phase = None
             amount = 0
 
-            # ★標準フォーマット以外の場合のみ、予算情報を入力させる★
             if not is_standard:
                 st.caption("※ 金額が発生する場合のみ入力してください")
                 c_y, c_c, c_p = st.columns(3)
@@ -228,7 +307,6 @@ def main():
                 with c_p: phase = st.selectbox("フェーズ", ["執行", "計画(来期予算等)", "報告のみ"], index=["執行", "計画(来期予算等)", "報告のみ"].index(default_phase) if default_phase in ["執行", "計画(来期予算等)", "報告のみ"] else 0)
                 amount = st.number_input("金額 (円)", value=default_amount, step=1000)
             else:
-                # 標準の場合は金額のみ（予算集計はしない）
                 amount = st.number_input("金額 (円) ※必要な場合のみ", value=default_amount, step=1000)
 
             st.markdown("##### 2. 詳細内容")
@@ -244,7 +322,6 @@ def main():
                 if isinstance(schema, str): schema = json.loads(schema)
                 
                 content = ""
-                # レイアウトレンダリング
                 fields = schema
                 rows = []
                 current_row = []
@@ -266,7 +343,6 @@ def main():
                             label = field['label']
                             typ = field['type']
                             init_val = loaded_custom_data.get(label, "")
-                            
                             if typ == "text": val = st.text_input(label, value=str(init_val))
                             elif typ == "number": val = st.number_input(label, value=int(init_val) if init_val else 0)
                             elif typ == "date":
@@ -281,36 +357,23 @@ def main():
                                 idx = opts.index(init_val) if init_val in opts else 0
                                 val = st.selectbox(label, opts, index=idx)
                             elif typ == "checkbox": val = st.checkbox(label, value=bool(init_val))
-                            
                             if isinstance(val, (datetime.date, datetime.datetime)): custom_values[label] = str(val)
                             else: custom_values[label] = val
 
             st.markdown("##### 3. 添付ファイル")
             uploaded_files = st.file_uploader("資料", accept_multiple_files=True)
             
-            # --- フォーム送信ボタン群 ---
-            # ここではまだルート確定せず、ボタンでアクションする
-            
             c1, c2 = st.columns([1, 1])
             with c1:
-                # キャンセルや保存などのアクション
                 if st.form_submit_button("キャンセル"):
                     st.session_state["page_mode"] = "list"
                     st.rerun()
             with c2:
-                # フォームの内容を一時保存（ルート設定へ進むため）はStreamlitの仕様上難しいので
-                # ここで一気に確定させる必要があるが、ルートビルダーはFormの外に置く必要がある
-                # (Formの中に動的なボタンを置くとリセットされるため)
-                # 解決策：ルート設定エリアはフォームの外に出すか、
-                # フォームのsubmitボタンを「確認画面へ」にするのが定石ですが、
-                # 今回はシンプルに「ルート設定」をフォームの下に配置し、
-                # 申請ボタンをフォームの外（または別のフォーム）にする構成に変更します。
                 pass
 
-        # --- ★ルートビルダー（フォームの外に配置して動的操作を可能に）---
+        # ルートビルダー (再提出時は既存ルートを修正可能)
         st.markdown("##### 4. 回付・承認ルート設定")
         with st.container(border=True):
-            # ユーザーリスト取得
             users_df = conn.query("SELECT display_name, role, user_id FROM M_Users ORDER BY role DESC", ttl=60)
             user_options = {f"{row['display_name']} ({row['role']})": row for i, row in users_df.iterrows()}
             
@@ -320,16 +383,13 @@ def main():
             with c_add2:
                 if st.button("ルートに追加"):
                     u_row = user_options[selected_user_label]
-                    st.session_state["draft_route"].append({
-                        "id": u_row['user_id'],
-                        "name": u_row['display_name'],
-                        "role": u_row['role']
-                    })
+                    # State初期化忘れ対策
+                    if "draft_route" not in st.session_state: st.session_state["draft_route"] = []
+                    st.session_state["draft_route"].append({"id": u_row['user_id'], "name": u_row['display_name'], "role": u_row['role']})
                     st.rerun()
 
-            # 現在のルート表示（並べ替え・削除）
             if not st.session_state.get("draft_route"):
-                st.info("ルートが設定されていません。上から追加してください。")
+                st.info("ルートが設定されていません")
             else:
                 route = st.session_state["draft_route"]
                 for i, r in enumerate(route):
@@ -349,29 +409,21 @@ def main():
                             route.pop(i)
                             st.rerun()
 
-        # --- 最終アクションエリア ---
         st.markdown("---")
         col_final1, col_final2 = st.columns(2)
-        
         with col_final1:
             if st.button("下書き保存", use_container_width=True):
-                 save_data(conn, is_new, edit_id, my_name, my_email, subject, amount, content, "下書き", uploaded_files, st.session_state["draft_route"], selected_template_id, custom_values, fiscal_year, budget_cat, phase)
+                 save_data(conn, is_new, edit_id, my_name, my_email, subject, amount, content, "下書き", uploaded_files, st.session_state.get("draft_route", []), selected_template_id, custom_values, fiscal_year, budget_cat, phase)
                  st.toast("下書き保存しました")
                  st.session_state["page_mode"] = "list"
                  st.rerun()
-
         with col_final2:
-            if st.button("起案・回付する", type="primary", use_container_width=True):
-                # バリデーション
-                if not subject:
-                    st.warning("件名を入力してください")
-                elif not st.session_state["draft_route"]:
-                    st.warning("回付ルートを1人以上設定してください")
+            btn_label = "起案・回付する" if is_new else "修正して再提出する"
+            if st.button(btn_label, type="primary", use_container_width=True):
+                if not subject: st.warning("件名を入力してください")
+                elif not st.session_state.get("draft_route"): st.warning("回付ルートを設定してください")
                 else:
                     save_data(conn, is_new, edit_id, my_name, my_email, subject, amount, content, "申請中", uploaded_files, st.session_state["draft_route"], selected_template_id, custom_values, fiscal_year, budget_cat, phase)
-                    # メール通知はルートの1人目へ
-                    first_approver = st.session_state["draft_route"][0]
-                    send_email_notification(first_approver['id'], subject, "業務回付")
                     st.success("回付を開始しました！")
                     st.session_state["page_mode"] = "list"
                     st.rerun()
@@ -394,8 +446,9 @@ def save_data(conn, is_new, ringi_id, name, email, subject, amount, content, sta
                 f_url, f_name = upload_file_to_storage(f)
                 if f_url: s.execute(text("INSERT INTO T_Ringi_Attachments (ringi_id, file_name, file_url) VALUES (:rid, :fn, :fu)"), {"rid": target_id, "fn": f_name, "fu": f_url})
 
-        # ルート更新
-        if approver_list: # 下書きでルート空の場合は更新しない運用も可だが、ここでは上書きする
+        # ルート更新 (新規 or 再提出時)
+        # ステータスが「申請中」になるタイミングで、指定されたルートで洗い替えを行う
+        if status == "申請中" and approver_list:
             s.execute(text(f"DELETE FROM T_Ringi_Approvals WHERE ringi_id={target_id}"))
             for i, user in enumerate(approver_list):
                 s.execute(text("INSERT INTO T_Ringi_Approvals (ringi_id, step_order, approver_id, approver_name, approver_role) VALUES (:rid, :ord, :uid, :nm, :role)"),
