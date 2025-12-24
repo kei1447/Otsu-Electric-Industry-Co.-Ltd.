@@ -17,16 +17,22 @@ def main():
     st.set_page_config(page_title="帳票テンプレート作成", layout="wide")
     st.title("🛠 ノーコード帳票ビルダー")
     
-    # 認証チェック
     if "is_logged_in" not in st.session_state or not st.session_state["is_logged_in"]:
         st.warning("ログインしてください。")
         st.stop()
 
     conn = st.connection("supabase", type="sql")
 
-    # --- セッション状態で「作成中のフィールド」を管理 ---
     if "builder_fields" not in st.session_state:
         st.session_state["builder_fields"] = []
+
+    # --- ヘルパー関数: リストの並べ替え ---
+    def move_item(index, direction):
+        fields = st.session_state["builder_fields"]
+        if direction == "up" and index > 0:
+            fields[index], fields[index-1] = fields[index-1], fields[index]
+        elif direction == "down" and index < len(fields) - 1:
+            fields[index], fields[index+1] = fields[index+1], fields[index]
 
     # --- 画面構成 ---
     col_editor, col_preview = st.columns([1, 1])
@@ -36,49 +42,67 @@ def main():
         st.subheader("1. 項目を定義")
         
         with st.container(border=True):
-            # 新しいフィールドの追加フォーム
-            c1, c2 = st.columns(2)
+            c1, c2, c3 = st.columns([3, 2, 2])
             with c1:
-                new_label = st.text_input("項目名 (ラベル)", placeholder="例: 出張先、利用交通機関")
+                new_label = st.text_input("項目名 (ラベル)", placeholder="例: 金額、支払先")
             with c2:
                 new_type = st.selectbox("入力タイプ", ["text", "number", "date", "textarea", "select", "checkbox"])
+            with c3:
+                # 横幅設定
+                width_map = {"全幅 (100%)": 100, "1/2 (50%)": 50, "1/3 (33%)": 33, "1/4 (25%)": 25}
+                new_width_label = st.selectbox("横幅サイズ", list(width_map.keys()))
+                new_width = width_map[new_width_label]
             
-            # selectの場合の選択肢入力
             new_options = ""
             if new_type == "select":
-                new_options = st.text_input("選択肢 (カンマ区切り)", placeholder="新幹線, 飛行機, 電車")
+                new_options = st.text_input("選択肢 (カンマ区切り)", placeholder="A, B, C")
 
-            if st.button("フィールドを追加"):
+            if st.button("フィールドを追加", use_container_width=True):
                 if not new_label:
                     st.warning("項目名は必須です")
                 else:
                     field_def = {
                         "label": new_label,
                         "type": new_type,
+                        "width": new_width, # 幅情報を保存
                         "options": new_options.split(",") if new_type == "select" and new_options else []
                     }
                     st.session_state["builder_fields"].append(field_def)
                     st.rerun()
 
         st.markdown("---")
-        st.subheader("現在のフィールド構成")
+        st.subheader("フィールド構成 (並べ替え可)")
         
-        # 追加されたフィールドのリスト表示（削除機能付き）
         if not st.session_state["builder_fields"]:
-            st.info("まだ項目がありません。上から追加してください。")
+            st.info("項目を追加してください")
         else:
             for i, field in enumerate(st.session_state["builder_fields"]):
                 with st.container(border=True):
-                    c_info, c_del = st.columns([4, 1])
+                    # レイアウト: [↑][↓] [内容] [削除]
+                    c_up, c_down, c_info, c_del = st.columns([1, 1, 8, 1])
+                    
+                    with c_up:
+                        if i > 0:
+                            if st.button("↑", key=f"up_{i}"):
+                                move_item(i, "up")
+                                st.rerun()
+                    with c_down:
+                        if i < len(st.session_state["builder_fields"]) - 1:
+                            if st.button("↓", key=f"down_{i}"):
+                                move_item(i, "down")
+                                st.rerun()
+                    
                     with c_info:
-                        st.markdown(f"**{i+1}. {field['label']}** ({field['type']})")
+                        w_lbl = "全幅" if field['width'] == 100 else f"幅{field['width']}%"
+                        st.markdown(f"**{field['label']}** ({field['type']}) - {w_lbl}")
                         if field['options']:
                             st.caption(f"選択肢: {', '.join(field['options'])}")
+                            
                     with c_del:
                         if st.button("🗑", key=f"del_{i}"):
                             st.session_state["builder_fields"].pop(i)
                             st.rerun()
-                            
+
             if st.button("全クリア", type="secondary"):
                 st.session_state["builder_fields"] = []
                 st.rerun()
@@ -86,46 +110,51 @@ def main():
     # === 右側: プレビュー & 保存 ===
     with col_preview:
         st.subheader("2. プレビュー & 保存")
-        
-        template_name = st.text_input("テンプレート名", placeholder="例: 出張申請書 v1")
+        template_name = st.text_input("テンプレート名", placeholder="例: 支払依頼書 v2")
         
         with st.container(border=True):
             st.markdown(f"### 📄 {template_name if template_name else '(名称未定)'}")
             st.markdown("---")
             
-            # --- プレビューレンダリング ---
-            # ここではinputの戻り値を受け取る必要はないので表示だけ
-            for field in st.session_state["builder_fields"]:
-                lbl = field['label']
-                typ = field['type']
+            # --- レンダリングロジック (行の折り返し計算) ---
+            fields = st.session_state["builder_fields"]
+            if fields:
+                rows = []
+                current_row = []
+                current_width_sum = 0
                 
-                if typ == "text":
-                    st.text_input(lbl, key=f"prev_{lbl}")
-                elif typ == "number":
-                    st.number_input(lbl, step=1, key=f"prev_{lbl}")
-                elif typ == "date":
-                    st.date_input(lbl, key=f"prev_{lbl}")
-                elif typ == "textarea":
-                    st.text_area(lbl, key=f"prev_{lbl}")
-                elif typ == "select":
-                    st.selectbox(lbl, field['options'], key=f"prev_{lbl}")
-                elif typ == "checkbox":
-                    st.checkbox(lbl, key=f"prev_{lbl}")
+                for f in fields:
+                    w = f.get('width', 100)
+                    if current_width_sum + w > 100:
+                        rows.append(current_row)
+                        current_row = []
+                        current_width_sum = 0
+                    current_row.append(f)
+                    current_width_sum += w
+                if current_row: rows.append(current_row)
+                
+                # 描画
+                for row_fields in rows:
+                    cols = st.columns([f.get('width', 100) for f in row_fields])
+                    for col, field in zip(cols, row_fields):
+                        with col:
+                            lbl = field['label']
+                            typ = field['type']
+                            if typ == "text": st.text_input(lbl, key=f"p_{lbl}")
+                            elif typ == "number": st.number_input(lbl, step=1, key=f"p_{lbl}")
+                            elif typ == "date": st.date_input(lbl, key=f"p_{lbl}")
+                            elif typ == "textarea": st.text_area(lbl, key=f"p_{lbl}")
+                            elif typ == "select": st.selectbox(lbl, field['options'], key=f"p_{lbl}")
+                            elif typ == "checkbox": st.checkbox(lbl, key=f"p_{lbl}")
             
             st.markdown("---")
-            # 共通項目（固定）のイメージ
-            st.caption("※ 件名・金額・添付ファイル・承認ルート設定は、全テンプレート共通で自動付与されます。")
+            st.caption("※ 共通項目（件名・金額・添付・ルート）は自動付与されます")
 
-        # 保存ボタン
-        if st.button("この内容でテンプレートを登録", type="primary", use_container_width=True):
-            if not template_name:
-                st.error("テンプレート名を入力してください")
-            elif not st.session_state["builder_fields"]:
-                st.error("フィールドが1つもありません")
+        if st.button("テンプレートを登録", type="primary", use_container_width=True):
+            if not template_name or not fields:
+                st.error("テンプレート名と項目を設定してください")
             else:
-                # JSONに変換して保存
-                schema_json = json.dumps(st.session_state["builder_fields"], ensure_ascii=False)
-                
+                schema_json = json.dumps(fields, ensure_ascii=False)
                 try:
                     with conn.session as s:
                         s.execute(
@@ -133,14 +162,14 @@ def main():
                             {"name": template_name, "json": schema_json}
                         )
                         s.commit()
-                    st.success(f"テンプレート「{template_name}」を保存しました！")
-                    st.session_state["builder_fields"] = [] # クリア
+                    st.success(f"保存しました: {template_name}")
+                    st.session_state["builder_fields"] = []
                 except Exception as e:
                     st.error(f"保存エラー: {e}")
 
-    # --- 既存テンプレート一覧 ---
+    # --- 一覧 ---
     st.markdown("---")
-    st.subheader("登録済みテンプレート一覧")
+    st.subheader("登録済みテンプレート")
     df_temp = conn.query("SELECT * FROM M_Templates ORDER BY template_id DESC", ttl=0)
     st.dataframe(df_temp, use_container_width=True)
 
