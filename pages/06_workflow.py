@@ -37,7 +37,8 @@ def send_email_notification(to_email, subject, body):
 
 # --- メイン処理 ---
 def main():
-    st.title("🈸 稟議・申請ステータスボード")
+    # ★タイトル変更: より包括的な名称へ
+    st.title("🈸 業務ワークフロー (申請・報告)")
 
     if "is_logged_in" not in st.session_state or not st.session_state["is_logged_in"]:
         st.error("ログインしてください。")
@@ -50,7 +51,7 @@ def main():
     conn = st.connection("supabase", type="sql")
 
     # --- アクションメニュー ---
-    if st.button("＋ 新規作成", type="primary", use_container_width=True):
+    if st.button("＋ 新規起案", type="primary", use_container_width=True):
         st.session_state["editing_ringi_id"] = None
         st.session_state["page_mode"] = "edit"
         st.rerun()
@@ -64,23 +65,27 @@ def main():
     # モードA: ステータス一覧ボード
     # ==================================================
     if st.session_state["page_mode"] == "list":
-        # (前回と同じ一覧表示ロジック)
-        sql_my_app = f"SELECT ringi_id, created_at, subject, amount, status, applicant_name, '申請分' as type FROM T_Ringi_Header WHERE applicant_email = '{my_email}'"
+        
+        # 自分の起案分
+        sql_my_app = f"SELECT ringi_id, created_at, subject, amount, status, applicant_name, '起案分' as type FROM T_Ringi_Header WHERE applicant_email = '{my_email}'"
+        
+        # 自分への回付待ち
         sql_to_approve = f"""
             UNION ALL
-            SELECT h.ringi_id, h.created_at, h.subject, h.amount, '承認待ち' as status, h.applicant_name, '承認待' as type
+            SELECT h.ringi_id, h.created_at, h.subject, h.amount, '確認・承認待ち' as status, h.applicant_name, '受信トレイ' as type
             FROM T_Ringi_Header h
             JOIN T_Ringi_Approvals a ON h.ringi_id = a.ringi_id
             WHERE a.approver_id = '{my_email}' AND a.status = '未承認' AND h.status != '却下'
         """
+        
         final_sql = f"SELECT * FROM ({sql_my_app} {sql_to_approve}) AS merged ORDER BY ringi_id DESC"
         df_list = conn.query(final_sql, ttl=0)
 
-        tab1, tab2 = st.tabs(["📋 全案件ステータス", "✅ 承認作業トレイ"])
+        tab1, tab2 = st.tabs(["📋 全案件ステータス", "✅ 受信トレイ (確認・承認)"])
         
         with tab1:
-            st.caption("あなたが関わった案件一覧")
-            df_view = df_list[df_list['type'] == '申請分']
+            st.caption("あなたが関わった案件（申請・報告）の一覧")
+            df_view = df_list[df_list['type'] == '起案分']
             if df_view.empty:
                 st.info("データなし")
             else:
@@ -91,14 +96,15 @@ def main():
                     with st.container(border=True):
                         st.subheader(f"{row['subject']}")
                         if row["status"] == "下書き":
-                            if st.button("✏️ 編集・申請する"):
+                            if st.button("✏️ 編集・回付する"):
                                 st.session_state["editing_ringi_id"] = selected_id
                                 st.session_state["page_mode"] = "edit"
                                 st.rerun()
                         else:
                             st.write(f"**ステータス:** {row['status']}")
-                            # 予算情報の表示を追加
-                            st.caption(f"💰 {row.get('fiscal_year', '-')}年度 | {row.get('budget_category', '-')} | {row.get('phase', '-')}")
+                            # 予算情報の表示
+                            if row.get('phase') == '計画(来期予算等)':
+                                st.caption(f"💰 {row.get('fiscal_year', '-')}年度 予算計画 | {row.get('budget_category', '-')}")
                             
                             if row['custom_data']:
                                 st.markdown("---")
@@ -116,19 +122,20 @@ def main():
                                 if s_row['comment']: st.info(f"💬 {s_row['comment']}")
 
         with tab2:
-            df_app = df_list[df_list['type'] == '承認待']
+            df_app = df_list[df_list['type'] == '受信トレイ']
             if df_app.empty:
-                st.info("承認依頼はありません")
+                st.info("現在、あなたへの回付案件はありません")
             else:
                 for i, row in df_app.iterrows():
                     with st.container(border=True):
                         st.markdown(f"**No.{row['ringi_id']} {row['subject']}**")
-                        st.write(f"申請者: {row['applicant_name']} | ¥{row['amount']:,}")
+                        st.caption(f"起案者: {row['applicant_name']}")
                         
                         detail_row = conn.query(f"SELECT * FROM T_Ringi_Header WHERE ringi_id={row['ringi_id']}", ttl=0).iloc[0]
-                        with st.expander("申請内容の詳細を見る"):
+                        with st.expander("詳細を見る"):
                             # 予算情報の表示
-                            st.caption(f"💰 {detail_row.get('fiscal_year', '-')}年度 | {detail_row.get('budget_category', '-')} | {detail_row.get('phase', '-')}")
+                            if detail_row.get('phase') == '計画(来期予算等)':
+                                st.caption(f"💰 {detail_row.get('fiscal_year', '-')}年度 予算計画")
                             
                             if detail_row['custom_data']:
                                 c_data = detail_row['custom_data']
@@ -139,27 +146,28 @@ def main():
                             files = conn.query(f"SELECT file_name, file_url FROM T_Ringi_Attachments WHERE ringi_id = {row['ringi_id']}", ttl=0)
                             for _, f in files.iterrows(): st.markdown(f"📎 [{f['file_name']}]({f['file_url']})")
 
-                        comment = st.text_input("💬 コメント", key=f"cmt_{row['ringi_id']}")
+                        comment = st.text_input("💬 コメント / 確認メモ", key=f"cmt_{row['ringi_id']}")
                         c_a, c_b = st.columns(2)
                         with c_a:
-                            if st.button("承認する", key=f"app_{row['ringi_id']}", type="primary", use_container_width=True):
+                            # ボタン文言も「承認」から汎用的な表現へ
+                            if st.button("承認 / 確認済", key=f"app_{row['ringi_id']}", type="primary", use_container_width=True):
                                 with conn.session as s:
                                     now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
                                     s.execute(text("UPDATE T_Ringi_Approvals SET status='承認', approved_at=:at, comment=:cm WHERE ringi_id=:rid AND approver_id=:uid"), {"at": now, "cm": comment, "rid": row['ringi_id'], "uid": my_email})
                                     pending = s.execute(text(f"SELECT count(*) FROM T_Ringi_Approvals WHERE ringi_id={row['ringi_id']} AND status='未承認'")).fetchone()[0]
                                     if pending == 0: s.execute(text("UPDATE T_Ringi_Header SET status='決裁完了' WHERE ringi_id=:rid"), {"rid": row['ringi_id']})
                                     s.commit()
-                                send_email_notification("applicant@example.com", f"【承認】{row['subject']}", f"{my_name}が承認しました。")
-                                st.success("承認しました")
+                                send_email_notification("applicant@example.com", f"【完了】{row['subject']}", f"{my_name}が確認・承認しました。")
+                                st.success("処理しました")
                                 st.rerun()
                         with c_b:
-                            if st.button("却下する", key=f"rej_{row['ringi_id']}", use_container_width=True):
+                            if st.button("差戻し / 却下", key=f"rej_{row['ringi_id']}", use_container_width=True):
                                  with conn.session as s:
                                     s.execute(text("UPDATE T_Ringi_Approvals SET status='却下', approved_at=:at, comment=:cm WHERE ringi_id=:rid AND approver_id=:uid"), {"at": datetime.datetime.now(), "cm": comment, "rid": row['ringi_id'], "uid": my_email})
                                     s.execute(text("UPDATE T_Ringi_Header SET status='却下' WHERE ringi_id=:rid"), {"rid": row['ringi_id']})
                                     s.commit()
-                                 send_email_notification("applicant@example.com", f"【却下】{row['subject']}", f"理由: {comment}")
-                                 st.error("却下しました")
+                                 send_email_notification("applicant@example.com", f"【差戻】{row['subject']}", f"理由: {comment}")
+                                 st.error("差し戻しました")
                                  st.rerun()
 
     # ==================================================
@@ -168,7 +176,7 @@ def main():
     elif st.session_state["page_mode"] == "edit":
         edit_id = st.session_state.get("editing_ringi_id")
         is_new = edit_id is None
-        st.subheader("📝 稟議・申請作成")
+        st.subheader("📝 新規起案" if is_new else "✏️ 案件編集")
         
         # テンプレート取得
         templates_df = conn.query("SELECT * FROM M_Templates ORDER BY template_id", ttl=60)
@@ -203,39 +211,40 @@ def main():
 
         # テンプレート選択
         template_name = st.selectbox(
-            "申請書の種類", 
-            options=["標準稟議書"] + list(template_options.keys()),
-            index=0 if not selected_template_name else (["標準稟議書"] + list(template_options.keys())).index(selected_template_name)
+            "案件の種類 (テンプレート)", 
+            options=["標準フォーマット"] + list(template_options.keys()),
+            index=0 if not selected_template_name else (["標準フォーマット"] + list(template_options.keys())).index(selected_template_name)
         )
 
         with st.form("ringi_form"):
-            st.markdown("##### 1. 基本情報・予算")
-            subject = st.text_input("件名", value=default_subject)
+            st.markdown("##### 1. 基本情報")
+            subject = st.text_input("件名", value=default_subject, placeholder="例: ○○に関する報告、××購入の件")
             
-            # ★予算管理用フィールド★
+            # 予算属性（ここも「予算管理を行う場合」のみ入力させるように見出しを工夫）
+            st.caption("※ 金額が発生する場合のみ入力してください")
             c_y, c_c, c_p = st.columns(3)
             with c_y:
                 fiscal_year = st.number_input("対象年度", value=default_fy, step=1)
             with c_c:
-                budget_cat = st.selectbox("予算区分", ["予算内", "突発(予算外)", "その他"], index=["予算内", "突発(予算外)", "その他"].index(default_cat) if default_cat in ["予算内", "突発(予算外)", "その他"] else 0)
+                budget_cat = st.selectbox("予算区分", ["予算内", "突発(予算外)", "その他(報告等)"], index=["予算内", "突発(予算外)", "その他(報告等)"].index(default_cat) if default_cat in ["予算内", "突発(予算外)", "その他(報告等)"] else 0)
             with c_p:
-                phase = st.selectbox("フェーズ", ["執行", "計画(来期予算等)"], index=["執行", "計画(来期予算等)"].index(default_phase) if default_phase in ["執行", "計画(来期予算等)"] else 0)
+                phase = st.selectbox("フェーズ", ["執行", "計画(来期予算等)", "報告のみ"], index=["執行", "計画(来期予算等)", "報告のみ"].index(default_phase) if default_phase in ["執行", "計画(来期予算等)", "報告のみ"] else 0)
             
-            amount = st.number_input("金額 (円)", value=default_amount, step=1000, help="実際に動くお金、または予算取りする概算額")
+            amount = st.number_input("金額 (円)", value=default_amount, step=1000)
 
-            st.markdown("##### 2. 申請内容")
+            st.markdown("##### 2. 詳細内容")
             custom_values = {}
             selected_template_id = None
             
-            if template_name == "標準稟議書":
-                content = st.text_area("内容・理由", value=default_content, height=150)
+            if template_name == "標準フォーマット":
+                content = st.text_area("内容・理由・報告事項", value=default_content, height=150)
             else:
                 target_temp = template_options[template_name]
                 selected_template_id = int(target_temp['template_id'])
                 schema = target_temp['schema_json']
                 if isinstance(schema, str): schema = json.loads(schema)
                 
-                content = "" # テンプレ利用時は標準テキストは空
+                content = ""
                 for field in schema:
                     label = field['label']
                     typ = field['type']
@@ -258,13 +267,13 @@ def main():
                     if isinstance(val, (datetime.date, datetime.datetime)): custom_values[label] = str(val)
                     else: custom_values[label] = val
 
-            st.markdown("##### 3. 添付・ルート")
+            st.markdown("##### 3. 添付・回付ルート")
             uploaded_files = st.file_uploader("添付ファイル", accept_multiple_files=True)
             
             users_df = conn.query("SELECT display_name, role, user_id FROM M_Users ORDER BY role DESC", ttl=60)
             user_options = [f"{row['display_name']} ({row['role']})" for i, row in users_df.iterrows()]
             user_ids = users_df['user_id'].tolist()
-            selected_approvers = st.multiselect("承認ルート (必須)", options=user_options)
+            selected_approvers = st.multiselect("回付・承認ルート (必須)", options=user_options, help="報告の場合は、共有したい相手を選択してください")
 
             c1, c2, c3 = st.columns(3)
             with c1:
@@ -278,9 +287,10 @@ def main():
                     st.session_state["page_mode"] = "list"
                     st.rerun()
             with c3:
-                if st.form_submit_button("申請する", type="primary"):
+                # ボタンも「申請」から「起案・回付」へ
+                if st.form_submit_button("起案・回付する", type="primary"):
                     if not subject: st.warning("件名は必須です")
-                    elif not selected_approvers: st.warning("承認ルートを設定してください")
+                    elif not selected_approvers: st.warning("回付ルートを設定してください")
                     else:
                         approver_data = []
                         for sel in selected_approvers:
@@ -288,8 +298,8 @@ def main():
                             approver_data.append({"id": user_ids[idx], "name": users_df.iloc[idx]['display_name'], "role": users_df.iloc[idx]['role']})
                         
                         save_data(conn, is_new, edit_id, my_name, my_email, subject, amount, content, "申請中", uploaded_files, approver_data, selected_template_id, custom_values, fiscal_year, budget_cat, phase)
-                        send_email_notification(approver_data[0]['id'], subject, "承認依頼")
-                        st.success("申請しました！")
+                        send_email_notification(approver_data[0]['id'], subject, "業務回付")
+                        st.success("回付を開始しました！")
                         st.session_state["page_mode"] = "list"
                         st.rerun()
 

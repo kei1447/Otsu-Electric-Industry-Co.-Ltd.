@@ -86,7 +86,7 @@ def main_app():
         st.page_link("app.py", label="🏠 ホーム", icon="🏠")
         
         # ★ここを修正しました (06_workflow.py)
-        st.page_link("pages/06_workflow.py", label="✅ 申請・承認ワークフロー", icon="✅")
+        st.page_link("pages/06_workflow.py", label="✅ 業務ワークフロー", icon="✅")
         
         # 新機能へのリンクも追加
         st.page_link("pages/07_search_database.py", label="🔎 案件データベース", icon="🔎")
