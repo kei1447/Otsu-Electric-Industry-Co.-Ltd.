@@ -9,11 +9,6 @@ from ultralytics import YOLO
 from google.cloud import vision
 from google.oauth2 import service_account
 
-# --- ログイン認証チェック ---
-if "password_correct" not in st.session_state or not st.session_state["password_correct"]:
-    st.warning("⚠️ ログインしていません。左上の「app」に戻ってログインしてください。")
-    st.stop()
-
 # --- 設定 ---
 YOLO_MODEL_PATH = "best.pt" 
 MAX_PAIRS_PER_IMAGE = 12
@@ -22,6 +17,15 @@ QUANTITY_LABEL = 1
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
+# --- 認証チェック (修正ポイント) ---
+# 新しい認証システム (is_logged_in) をチェックするように変更しました
+if "is_logged_in" not in st.session_state or not st.session_state["is_logged_in"]:
+    st.warning("⚠️ ログインしていません。ホーム画面に戻ってログインしてください。")
+    st.stop()
+
+# --- ユーザー情報の取得 (オプション) ---
+user_name = st.session_state.get("user_name", "Unknown")
+
 # --- 認証と初期化 ---
 @st.cache_resource
 def load_models():
@@ -29,10 +33,13 @@ def load_models():
     # 1. YOLOモデル
     model_path = YOLO_MODEL_PATH
     if not os.path.exists(model_path):
+        # pagesフォルダから見た相対パス対応
         if os.path.exists(f"../{YOLO_MODEL_PATH}"):
             model_path = f"../{YOLO_MODEL_PATH}"
+        elif os.path.exists(f"pages/{YOLO_MODEL_PATH}"): # 念のため
+            model_path = f"pages/{YOLO_MODEL_PATH}"
         else:
-            st.error(f"モデルファイル({YOLO_MODEL_PATH})が見つかりません。")
+            # モデルが見つからない場合はエラーを出さずNoneを返す（画面で警告）
             return None, None
     
     try:
@@ -44,7 +51,7 @@ def load_models():
     # 2. Google Vision Client
     try:
         if "gcp_service_account" not in st.secrets:
-            st.error("SecretsにGCP認証情報が設定されていません。")
+            # Secretsがない場合はNoneを返す
             return yolo, None
             
         key_dict = dict(st.secrets["gcp_service_account"])
@@ -58,7 +65,7 @@ def load_models():
 
 yolo_model, vision_client = load_models()
 
-# --- 関数群 ---
+# --- 関数群 (前回と同じ) ---
 
 def pdf_to_images(file_bytes):
     try:
@@ -79,6 +86,7 @@ def tiff_to_images(file_bytes):
     return images
 
 def detect_regions_with_yolo(image):
+    if yolo_model is None: return []
     results = yolo_model(image)
     if not results or not results[0].boxes:
         return []
@@ -90,12 +98,10 @@ def pair_regions(regions):
     name_regions = [r for r in regions if r["label"] == NAME_LABEL]
     quantity_regions = [r for r in regions if r["label"] == QUANTITY_LABEL]
     
-    # 上から順にソート（Y座標）
     name_regions.sort(key=lambda x: x["coords"][1])
     quantity_regions.sort(key=lambda x: x["coords"][1])
 
     paired = []
-    # 少ない方に合わせてペアリング
     for i in range(min(len(name_regions), len(quantity_regions))):
         paired.append({
             "name_coords": name_regions[i]["coords"],
@@ -108,7 +114,6 @@ def combine_multiple_paired_regions(image, paired_regions, max_pairs=MAX_PAIRS_P
         return []
 
     images_to_return = []
-    
     current_batch = []
     current_height = 0
     current_width = 0
@@ -134,26 +139,22 @@ def combine_multiple_paired_regions(image, paired_regions, max_pairs=MAX_PAIRS_P
         if (i + 1) % max_pairs == 0 or (i + 1) == len(paired_regions):
             final_img = Image.new("RGB", (current_width, current_height), "white")
             y_offset = 0
-            
             pair_locations = []
             
             for item in current_batch:
                 p_img = item["img"]
                 final_img.paste(p_img, (0, y_offset))
-                
                 pair_locations.append({
                     "top": y_offset,
                     "bottom": y_offset + p_img.height,
                     "split_y_absolute": y_offset + item["boundary"]
                 })
-                
                 y_offset += p_img.height + padding
             
             images_to_return.append({
                 "image": final_img,
                 "metadata": pair_locations
             })
-            
             current_batch = []
             current_height = 0
             current_width = 0
@@ -200,10 +201,7 @@ def perform_ocr_and_parse(combined_data):
             raw_name = "".join(p["name"])
             raw_qty = "".join(p["quantity"])
             
-            # O/o -> 0 変換
-            cleaned_name = raw_name.replace("O", "0").replace("o", "0")
-            cleaned_name = cleaned_name.replace(" ", "")
-            
+            cleaned_name = raw_name.replace("O", "0").replace("o", "0").replace(" ", "")
             cleaned_qty = raw_qty.replace(" ", "")
             
             results.append((cleaned_name, cleaned_qty))
@@ -219,7 +217,13 @@ def main():
     st.set_page_config(page_title="OCR Tool", layout="wide")
     
     st.title("📄 AI-OCR 自動集計ツール")
-    st.markdown("YOLO検出 → 座標ベースOCR解析 → 編集＆ダウンロード")
+    st.markdown(f"User: **{user_name}** | YOLO検出 → 座標ベースOCR解析 → 編集＆ダウンロード")
+
+    # モデル・APIチェック
+    if yolo_model is None:
+        st.error("❌ YOLOモデル (best.pt) が見つかりません。GitHubにアップロードされているか確認してください。")
+    if vision_client is None:
+        st.warning("⚠️ Google Cloud Vision APIの設定が見つかりません。OCR機能は動作しません。")
 
     uploaded_file = st.file_uploader("PDF/TIFFアップロード (例: 251223AM.pdf)", type=["pdf", "tif", "tiff"])
 
@@ -231,9 +235,9 @@ def main():
             st.session_state["ocr_result_df"] = None
             st.session_state["last_uploaded_file"] = uploaded_file.name
 
-        if st.button("処理開始"):
+        if st.button("処理開始", type="primary"):
             if not yolo_model or not vision_client:
-                st.error("初期化失敗：モデルか認証情報が不足しています。")
+                st.error("処理を開始できません。モデルまたは認証情報が不足しています。")
                 st.stop()
 
             with st.spinner("画像を解析中..."):
@@ -254,7 +258,6 @@ def main():
             
             for i, image in enumerate(images):
                 progress_bar.progress((i + 1) / len(images))
-                
                 detections = detect_regions_with_yolo(image)
                 paired = pair_regions(detections)
                 combined_data_list = combine_multiple_paired_regions(image, paired, padding=30)
@@ -290,21 +293,17 @@ def main():
         
         st.subheader("📥 ダウンロード")
         
-        # ▼▼▼ ファイル名自動生成ロジック ▼▼▼
-        # 元ファイル名を取得 (例: 251223AM.pdf)
+        # ファイル名自動生成
         original_name = st.session_state.get("last_uploaded_file", "result.csv")
-        # 拡張子を除去 (例: 251223AM)
         base_name = os.path.splitext(original_name)[0]
-        # 頭に '20' をつけて .csv にする (例: 20251223AM.csv)
         download_filename = f"20{base_name}.csv"
-        # ▲▲▲ ここまで ▲▲▲
         
         csv_buffer = edited_df.to_csv(index=False).encode('utf-8-sig')
         
         col1, col2 = st.columns([1, 4])
         with col1:
             st.download_button(
-                label=f"CSVダウンロード ({download_filename})", # ボタンにもファイル名を表示
+                label=f"CSVダウンロード ({download_filename})",
                 data=csv_buffer,
                 file_name=download_filename,
                 mime="text/csv",
