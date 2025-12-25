@@ -9,38 +9,49 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- Supabase設定の読み込み ---
+# --- Supabase設定 ---
 try:
     SUPABASE_URL = st.secrets["connections"]["supabase"]["project_url"]
     SUPABASE_KEY = st.secrets["connections"]["supabase"]["key"]
 except Exception:
-    st.error("Secretsの設定が読み込めません。project_url と key を確認してください。")
+    st.error("Secretsの設定が読み込めません。")
     st.stop()
 
-# --- Supabaseクライアントの初期化 ---
-@st.cache_resource
-def init_supabase():
-    return create_client(SUPABASE_URL, SUPABASE_KEY)
-
-# --- ログイン処理関数 ---
-def login_with_auth(email, password):
-    client = init_supabase()
+# --- ログイン処理関数 (DB直接認証版) ---
+def login_with_db(email, password):
+    # Supabase接続 (データ取得用)
+    conn = st.connection("supabase", type="sql")
     try:
-        # 1. Authチェック
-        auth_response = client.auth.sign_in_with_password({"email": email, "password": password})
-        
-        # 2. 名簿(M_Users)チェック
-        conn = st.connection("supabase", type="sql")
+        # M_Usersから該当IDを取得
+        # ※本番運用ではパスワードはハッシュ化すべきですが、今回は平文で比較します
         df = conn.query(f"SELECT * FROM M_Users WHERE user_id = '{email}'", ttl=0)
         
         if df.empty:
-            return False, "システム利用権限がありません（ユーザーマスタ未登録）。", None
+            return False, "ユーザーが見つかりません。", None
         
         user_data = df.iloc[0]
-        return True, "ログイン成功", user_data
         
+        # アカウント無効チェック
+        if not user_data.get("is_active", True):
+             return False, "このアカウントは無効化されています。", None
+
+        # パスワード照合
+        # DBにパスワード列がない古いデータの場合のケア
+        db_pass = user_data.get("password")
+        if not db_pass:
+            # パスワード未設定なら、初期値 '1234' または 'test' で通す救済措置
+            if password in ["1234", "test"]:
+                return True, "ログイン成功(初期PW)", user_data
+            else:
+                return False, "パスワードが未設定です。管理者に連絡してください。", None
+        
+        if str(db_pass) == str(password):
+            return True, "ログイン成功", user_data
+        else:
+            return False, "パスワードが間違っています。", None
+            
     except Exception as e:
-        return False, "メールアドレスまたはパスワードが間違っています。", None
+        return False, f"システムエラー: {e}", None
 
 # --- 画面1: ログインページ ---
 def login_page():
@@ -54,6 +65,8 @@ def login_page():
             st.write("ログイン情報を入力してください")
             email = st.text_input("メールアドレス", placeholder="yourname@otsu-elec.co.jp")
             password = st.text_input("パスワード", type="password")
+            st.caption("※初期パスワードは '1234' です")
+            
             submitted = st.form_submit_button("ログイン", use_container_width=True)
             
             if submitted:
@@ -61,7 +74,7 @@ def login_page():
                     st.warning("メールアドレスとパスワードを入力してください。")
                 else:
                     with st.spinner("認証中..."):
-                        is_success, msg, user_data = login_with_auth(email, password)
+                        is_success, msg, user_data = login_with_db(email, password)
                     
                     if is_success:
                         st.success("認証成功！")
@@ -76,7 +89,6 @@ def login_page():
 
 # --- 画面2: メインポータル ---
 def main_app():
-    # サイドバー（メニュー）
     with st.sidebar:
         st.markdown(f"### 👤 {st.session_state['user_name']} 様")
         st.caption(f"権限: {st.session_state['role']}")
@@ -84,29 +96,23 @@ def main_app():
         
         st.markdown("### 📌 Menu")
         st.page_link("app.py", label="🏠 ホーム", icon="🏠")
-        
-        # ★ここを修正しました (06_workflow.py)
         st.page_link("pages/06_workflow.py", label="✅ 業務ワークフロー", icon="✅")
-        
-        # 新機能へのリンクも追加
         st.page_link("pages/07_search_database.py", label="🔎 案件データベース", icon="🔎")
         st.page_link("pages/08_dashboard.py", label="📊 経営ダッシュボード", icon="📊")
         st.page_link("pages/sekisui_ocr_tool.py", label="⚙️ OCRツール", icon="📄")
         
-        # 管理者向けメニュー（区分け）
         st.divider()
         st.caption("管理者メニュー")
         st.page_link("pages/90_template_builder.py", label="🛠 帳票テンプレート作成", icon="🛠")
+        st.page_link("pages/99_admin_users.py", label="👥 社員マスタ管理", icon="👥")
         
         st.divider()
         if st.button("ログアウト", type="secondary", use_container_width=True):
             st.session_state.clear()
             st.rerun()
 
-    # メインコンテンツ
     st.title("🏠 Dashboard")
     
-    # 役割別メッセージ
     if "課長" in st.session_state['role'] or "部長" in st.session_state['role'] or "社長" in st.session_state['role']:
         st.info(f"お疲れ様です。承認待ち案件や経営状況は、左のメニューから確認できます。")
     else:
@@ -129,14 +135,12 @@ def main_app():
             st.write("よく使うツールへのショートカット")
             col_a, col_b = st.columns(2)
             with col_a:
-                # ★ここも修正しました
-                if st.button("📄 申請書を作成", use_container_width=True):
+                if st.button("📄 新規起案", use_container_width=True):
                     st.switch_page("pages/06_workflow.py")
             with col_b:
-                if st.button("⚙️ 図面OCR処理", use_container_width=True):
+                if st.button("⚙️ sekisui_OCR処理", use_container_width=True):
                     st.switch_page("pages/sekisui_ocr_tool.py")
 
-# --- ルーティング ---
 if "is_logged_in" not in st.session_state:
     st.session_state["is_logged_in"] = False
 
