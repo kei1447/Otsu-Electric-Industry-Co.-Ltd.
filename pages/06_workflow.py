@@ -35,6 +35,31 @@ def upload_file_to_storage(uploaded_file):
 def send_email_notification(to_email, subject, body):
     st.toast(f"📩 (Mail Simulation) To: {to_email} | {subject}")
 
+# フォーム初期値の設定関数
+def init_form_state(data=None):
+    if data:
+        st.session_state["form_subject"] = data["subject"]
+        st.session_state["form_amount"] = data["amount"]
+        st.session_state["form_content"] = data["content"]
+        st.session_state["form_fy"] = data.get("fiscal_year")
+        st.session_state["form_cat"] = data.get("budget_category")
+        st.session_state["form_phase"] = data.get("phase")
+        # カスタムデータは動的なので別途読み込みが必要だが、簡易的にここで保持
+        if data.get('custom_data'):
+            c_data = data['custom_data']
+            if isinstance(c_data, str): c_data = json.loads(c_data)
+            for k, v in c_data.items():
+                st.session_state[f"custom_{k}"] = v
+    else:
+        # 新規時の初期値
+        st.session_state["form_subject"] = ""
+        st.session_state["form_amount"] = 0
+        st.session_state["form_content"] = ""
+        st.session_state["form_fy"] = 2025
+        st.session_state["form_cat"] = "予算内"
+        st.session_state["form_phase"] = "執行"
+        # カスタムフィールドのキーもクリアしたいが、動的なため上書きされるのを期待
+
 # --- メイン処理 ---
 def main():
     st.title("🈸 業務ワークフロー (申請・報告)")
@@ -43,12 +68,10 @@ def main():
         st.error("ログインしてください。")
         st.stop()
     
-    # セッション情報
     my_email = st.session_state["user_email"]
-
     conn = st.connection("supabase", type="sql")
 
-    # ユーザー情報の取得 (UUIDが必要なため)
+    # ユーザー情報の取得
     try:
         user_sql = f"SELECT id, display_name, role, department_id FROM public.profiles WHERE email = '{my_email}'"
         user_df = conn.query(user_sql, ttl=60)
@@ -67,6 +90,8 @@ def main():
         st.session_state["editing_workflow_id"] = None
         st.session_state["page_mode"] = "edit"
         st.session_state["draft_route"] = [] 
+        # フォーム初期化
+        init_form_state(None)
         st.rerun()
 
     st.markdown("---")
@@ -78,14 +103,12 @@ def main():
     # モードA: 一覧画面
     # ==================================================
     if st.session_state["page_mode"] == "list":
-        # 起案分（自身のUUIDで検索）
         sql_my_app = f"""
             SELECT h.workflow_id, h.created_at, h.subject, h.amount, h.status, p.display_name as applicant_name, '起案分' as type 
             FROM T_Workflow_Header h
             JOIN public.profiles p ON h.applicant_id = p.id
             WHERE h.applicant_id = '{my_uuid}'
         """
-        # 受信トレイ（自身のUUIDで承認待ちを検索）
         sql_to_approve = f"""
             UNION ALL
             SELECT h.workflow_id, h.created_at, h.subject, h.amount, '確認・承認待ち' as status, p.display_name as applicant_name, '受信トレイ' as type
@@ -106,18 +129,18 @@ def main():
                 st.dataframe(df_view[["workflow_id", "created_at", "subject", "amount", "status"]], use_container_width=True, hide_index=True)
                 selected_id = st.selectbox("案件詳細を確認", df_view["workflow_id"], index=None)
                 if selected_id:
-                    # 詳細取得
                     row = conn.query(f"SELECT * FROM T_Workflow_Header WHERE workflow_id = {selected_id}", ttl=0).iloc[0]
                     with st.container(border=True):
                         st.subheader(f"{row['subject']}")
                         
-                        # 下書き or 差戻し
                         if row["status"] in ["下書き", "差戻し"]:
                             msg = "下書き編集中" if row["status"] == "下書き" else "⚠️ 差戻し案件です。内容を修正して再提出してください。"
                             st.warning(msg)
                             if st.button("✏️ 編集・再提出する"):
                                 st.session_state["editing_workflow_id"] = selected_id
                                 st.session_state["page_mode"] = "edit"
+                                # 既存データの読み込みとStateへのセット
+                                init_form_state(row)
                                 # ルート復元
                                 existing_route = conn.query(f"SELECT approver_id, approver_name, approver_role FROM T_Workflow_Approvals WHERE workflow_id={selected_id} ORDER BY step_order", ttl=0)
                                 restored_route = []
@@ -137,7 +160,6 @@ def main():
                             else:
                                 st.write(f"**内容:** {row['content']}")
                             st.markdown("---")
-                            # 履歴表示
                             steps = conn.query(f"SELECT step_order, approver_role, approver_name, status, comment FROM T_Workflow_Approvals WHERE workflow_id = {selected_id} ORDER BY step_order", ttl=0)
                             for idx, s_row in steps.iterrows():
                                 icon = "✅" if s_row['status'] == '承認' else ("↩️" if s_row['status'] == '差戻し' else ("❌" if s_row['status'] == '却下' else "⏳"))
@@ -164,13 +186,10 @@ def main():
                             else:
                                 st.text(detail_row['content'])
                             files = conn.query(f"SELECT file_name, file_path FROM T_Workflow_Attachments WHERE workflow_id = {row['workflow_id']}", ttl=0)
-                            # Note: storage public URL生成が必要だが、ここでは簡易的にファイル名表示のみ、あるいは別ロジックが必要
-                            # 今回は file_path (URL想定) をそのまま表示
                             for _, f in files.iterrows(): 
-                                # file_pathにはURLが入っている想定（アップロード関数の戻り値）
                                 st.markdown(f"📎 {f['file_name']}") 
                         
-                        # --- ★ルート変更機能 ---
+                        # --- ルート変更機能 ---
                         with st.expander("⚙️ 承認ルートの確認・変更"):
                             current_step_df = conn.query(f"SELECT step_order FROM T_Workflow_Approvals WHERE workflow_id={row['workflow_id']} AND approver_id='{my_uuid}'", ttl=0)
                             if not current_step_df.empty:
@@ -188,7 +207,6 @@ def main():
                                 st.caption("▼ 現在予定されている後続のルート")
                                 current_future = st.session_state[future_route_key]
                                 
-                                # ユーザー選択: profilesから取得
                                 users_df = conn.query("SELECT display_name, role, id FROM public.profiles ORDER BY role DESC", ttl=60)
                                 u_opts = {f"{r['display_name']} ({r['role']})": r for _, r in users_df.iterrows()}
                                 add_u = st.selectbox("承認者を追加", list(u_opts.keys()), key=f"add_sel_{row['workflow_id']}")
@@ -198,7 +216,7 @@ def main():
                                     st.rerun()
 
                                 if not current_future:
-                                    st.info("後続の承認者はいません（あなたが最終決裁者です）。")
+                                    st.info("後続の承認者はいません。")
                                 else:
                                     for idx, fr in enumerate(current_future):
                                         fc1, fc2, fc3 = st.columns([0.5, 4, 1])
@@ -209,7 +227,6 @@ def main():
                                                 st.session_state[future_route_key].pop(idx)
                                                 st.rerun()
 
-                        # 承認アクション
                         comment = st.text_input("💬 コメント / 申し送り事項", key=f"cmt_{row['workflow_id']}")
                         c_a, c_b = st.columns(2)
                         
@@ -217,12 +234,9 @@ def main():
                             if st.button("承認 / 回付", key=f"app_{row['workflow_id']}", type="primary", use_container_width=True):
                                 with conn.session as s:
                                     now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
-                                    
-                                    # 1. 承認
                                     s.execute(text("UPDATE T_Workflow_Approvals SET status='承認', approved_at=:at, comment=:cm WHERE workflow_id=:rid AND approver_id=:uid"), 
                                                 {"at": now, "cm": comment, "rid": row['workflow_id'], "uid": my_uuid})
                                     
-                                    # 2. ルート再構築
                                     current_step_df = conn.query(f"SELECT step_order FROM T_Workflow_Approvals WHERE workflow_id={row['workflow_id']} AND approver_id='{my_uuid}'", ttl=0)
                                     cur_step = current_step_df.iloc[0]['step_order']
                                     
@@ -238,11 +252,9 @@ def main():
                                             """), {"rid": row['workflow_id'], "ord": cur_step + 1 + i, "uid": usr['id'], "nm": usr['name'], "role": usr['role']})
                                         del st.session_state[future_route_key]
 
-                                    # 3. 完了判定
                                     pending = s.execute(text(f"SELECT count(*) FROM T_Workflow_Approvals WHERE workflow_id={row['workflow_id']} AND status='未承認'")).fetchone()[0]
                                     if pending == 0:
                                         s.execute(text("UPDATE T_Workflow_Header SET status='決裁完了' WHERE workflow_id=:rid"), {"rid": row['workflow_id']})
-                                    
                                     s.commit()
                                 
                                 send_email_notification("next@example.com", f"【承認・回付】{row['subject']}", f"{my_name}が承認しました。")
@@ -256,7 +268,6 @@ def main():
                                                 {"at": datetime.datetime.now(), "cm": comment, "rid": row['workflow_id'], "uid": my_uuid})
                                     s.execute(text("UPDATE T_Workflow_Header SET status='差戻し' WHERE workflow_id=:rid"), {"rid": row['workflow_id']})
                                     s.commit()
-                                 
                                  send_email_notification("applicant@example.com", f"【差戻】{row['subject']}", f"修正依頼: {comment}")
                                  st.warning("差し戻しました")
                                  st.rerun()
@@ -268,124 +279,108 @@ def main():
         edit_id = st.session_state.get("editing_workflow_id")
         is_new = edit_id is None
         
+        # セッションステート初期化チェック (ページリロード対策)
+        if "form_subject" not in st.session_state:
+            init_form_state(None)
+
         page_title = "📝 新規起案" if is_new else "✏️ 案件編集・再提出"
         st.subheader(page_title)
         
         templates_df = conn.query("SELECT * FROM M_Templates ORDER BY template_id", ttl=60)
         template_options = {row['template_name']: row for i, row in templates_df.iterrows()}
         
-        default_subject = ""
-        default_amount = 0
-        default_content = ""
-        default_fy = None
-        default_cat = None
-        default_phase = None
+        # 既存データのテンプレート名を特定 (編集時)
         selected_template_name = None
-        loaded_custom_data = {}
-
-        if not is_new:
-            existing = conn.query(f"SELECT * FROM T_Workflow_Header WHERE workflow_id = {edit_id}", ttl=0).iloc[0]
-            default_subject = existing["subject"]
-            default_amount = existing["amount"]
-            default_content = existing["content"]
-            default_fy = existing.get("fiscal_year")
-            default_cat = existing.get("budget_category")
-            default_phase = existing.get("phase")
+        if not is_new and edit_id:
+            existing = conn.query(f"SELECT template_id FROM T_Workflow_Header WHERE workflow_id = {edit_id}", ttl=0).iloc[0]
             if existing['template_id']:
                 temp_row = templates_df[templates_df['template_id'] == existing['template_id']]
                 if not temp_row.empty: selected_template_name = temp_row.iloc[0]['template_name']
-            if existing['custom_data']:
-                loaded_custom_data = existing['custom_data']
-                if isinstance(loaded_custom_data, str): loaded_custom_data = json.loads(loaded_custom_data)
-        
+
         template_name = st.selectbox("案件の種類", options=["標準フォーマット"] + list(template_options.keys()), index=0 if not selected_template_name else (["標準フォーマット"] + list(template_options.keys())).index(selected_template_name))
         is_standard = (template_name == "標準フォーマット")
 
-        with st.form("ringi_form"):
-            st.markdown("##### 1. 基本情報")
-            subject = st.text_input("件名", value=default_subject)
+        # --- フォーム入力部 (st.form廃止, keyでState管理) ---
+        st.markdown("##### 1. 基本情報")
+        # keyを指定することで、Stateに直接値を書き込む
+        st.text_input("件名", key="form_subject")
+        
+        fiscal_year = None
+        budget_cat = None
+        phase = None
+        amount = 0
+
+        if not is_standard:
+            st.caption("※ 金額が発生する場合のみ入力してください")
+            c_y, c_c, c_p = st.columns(3)
+            with c_y: st.number_input("対象年度", step=1, key="form_fy")
+            with c_c: st.selectbox("予算区分", ["予算内", "突発(予算外)", "その他"], key="form_cat")
+            with c_p: st.selectbox("フェーズ", ["執行", "計画(来期予算等)", "報告のみ"], key="form_phase")
+            st.number_input("金額 (円)", step=1000, key="form_amount")
+        else:
+            st.number_input("金額 (円) ※必要な場合のみ", step=1000, key="form_amount")
+
+        st.markdown("##### 2. 詳細内容")
+        custom_values = {}
+        selected_template_id = None
+        
+        if is_standard:
+            st.text_area("報告事項・内容", height=150, key="form_content")
+        else:
+            target_temp = template_options[template_name]
+            selected_template_id = int(target_temp['template_id'])
+            schema = target_temp['schema_json']
+            if isinstance(schema, str): schema = json.loads(schema)
             
-            fiscal_year = None
-            budget_cat = None
-            phase = None
-            amount = 0
+            # ダイナミックフォーム生成
+            fields = schema
+            rows = []
+            current_row = []
+            current_w = 0
+            for f in fields:
+                w = f.get('width', 100)
+                if current_w + w > 100:
+                    rows.append(current_row)
+                    current_row = []
+                    current_w = 0
+                current_row.append(f)
+                current_w += w
+            if current_row: rows.append(current_row)
 
-            if not is_standard:
-                st.caption("※ 金額が発生する場合のみ入力してください")
-                c_y, c_c, c_p = st.columns(3)
-                with c_y: fiscal_year = st.number_input("対象年度", value=default_fy if default_fy else 2025, step=1)
-                with c_c: budget_cat = st.selectbox("予算区分", ["予算内", "突発(予算外)", "その他"], index=["予算内", "突発(予算外)", "その他"].index(default_cat) if default_cat in ["予算内", "突発(予算外)", "その他"] else 0)
-                with c_p: phase = st.selectbox("フェーズ", ["執行", "計画(来期予算等)", "報告のみ"], index=["執行", "計画(来期予算等)", "報告のみ"].index(default_phase) if default_phase in ["執行", "計画(来期予算等)", "報告のみ"] else 0)
-                amount = st.number_input("金額 (円)", value=int(default_amount) if default_amount else 0, step=1000)
-            else:
-                amount = st.number_input("金額 (円) ※必要な場合のみ", value=int(default_amount) if default_amount else 0, step=1000)
-
-            st.markdown("##### 2. 詳細内容")
-            custom_values = {}
-            selected_template_id = None
-            
-            if is_standard:
-                content = st.text_area("報告事項・内容", value=default_content, height=150)
-            else:
-                target_temp = template_options[template_name]
-                selected_template_id = int(target_temp['template_id'])
-                schema = target_temp['schema_json']
-                if isinstance(schema, str): schema = json.loads(schema)
-                
-                content = ""
-                # ダイナミックフォーム生成ロジックは既存踏襲
-                fields = schema
-                rows = []
-                current_row = []
-                current_w = 0
-                for f in fields:
-                    w = f.get('width', 100)
-                    if current_w + w > 100:
-                        rows.append(current_row)
-                        current_row = []
-                        current_w = 0
-                    current_row.append(f)
-                    current_w += w
-                if current_row: rows.append(current_row)
-
-                for row_fields in rows:
-                    cols = st.columns([f.get('width', 100) for f in row_fields])
-                    for col, field in zip(cols, row_fields):
-                        with col:
-                            label = field['label']
-                            typ = field['type']
-                            init_val = loaded_custom_data.get(label, "")
-                            if typ == "text": val = st.text_input(label, value=str(init_val))
-                            elif typ == "number": val = st.number_input(label, value=int(init_val) if init_val else 0)
-                            elif typ == "date":
-                                d_val = None
-                                if init_val:
-                                    try: d_val = pd.to_datetime(init_val).date()
-                                    except: pass
-                                val = st.date_input(label, value=d_val)
-                            elif typ == "textarea": val = st.text_area(label, value=str(init_val))
-                            elif typ == "select":
-                                opts = field.get('options', [])
-                                idx = opts.index(init_val) if init_val in opts else 0
-                                val = st.selectbox(label, opts, index=idx)
-                            elif typ == "checkbox": val = st.checkbox(label, value=bool(init_val))
-                            
+            for row_fields in rows:
+                cols = st.columns([f.get('width', 100) for f in row_fields])
+                for col, field in zip(cols, row_fields):
+                    with col:
+                        label = field['label']
+                        typ = field['type']
+                        # 動的フィールドもkeyで管理
+                        field_key = f"custom_{label}"
+                        
+                        if typ == "text": st.text_input(label, key=field_key)
+                        elif typ == "number": st.number_input(label, step=1, key=field_key)
+                        elif typ == "date": st.date_input(label, key=field_key)
+                        elif typ == "textarea": st.text_area(label, key=field_key)
+                        elif typ == "select":
+                            opts = field.get('options', [])
+                            st.selectbox(label, opts, key=field_key)
+                        elif typ == "checkbox": st.checkbox(label, key=field_key)
+                        
+                        # 保存用に値を収集
+                        if field_key in st.session_state:
+                            val = st.session_state[field_key]
                             if isinstance(val, (datetime.date, datetime.datetime)): custom_values[label] = str(val)
                             else: custom_values[label] = val
 
-            st.markdown("##### 3. 添付ファイル")
-            uploaded_files = st.file_uploader("資料", accept_multiple_files=True)
-            
-            c1, c2 = st.columns([1, 1])
-            with c1:
-                if st.form_submit_button("キャンセル"):
-                    st.session_state["page_mode"] = "list"
-                    st.rerun()
+        st.markdown("##### 3. 添付ファイル")
+        uploaded_files = st.file_uploader("資料", accept_multiple_files=True)
+        
+        if st.button("キャンセル"):
+            st.session_state["page_mode"] = "list"
+            st.rerun()
 
         # ルートビルダー
         st.markdown("##### 4. 回付・承認ルート設定")
         with st.container(border=True):
-            # profilesからユーザーリスト取得
             users_df = conn.query("SELECT display_name, role, id FROM public.profiles ORDER BY role DESC", ttl=60)
             user_options = {f"{row['display_name']} ({row['role']})": row for i, row in users_df.iterrows()}
             
@@ -393,10 +388,10 @@ def main():
             with c_add1:
                 selected_user_label = st.selectbox("追加する人を選択", list(user_options.keys()), key="route_adder")
             with c_add2:
+                # フォームがないので、ここでボタンを押しても入力値（State）は保持されたままリランされる
                 if st.button("ルートに追加"):
                     u_row = user_options[selected_user_label]
                     if "draft_route" not in st.session_state: st.session_state["draft_route"] = []
-                    # idはUUID
                     st.session_state["draft_route"].append({"id": u_row['id'], "name": u_row['display_name'], "role": u_row['role']})
                     st.rerun()
 
@@ -425,17 +420,33 @@ def main():
         col_final1, col_final2 = st.columns(2)
         with col_final1:
             if st.button("下書き保存", use_container_width=True):
-                 save_data(conn, is_new, edit_id, my_uuid, subject, amount, content, "下書き", uploaded_files, st.session_state.get("draft_route", []), selected_template_id, custom_values, fiscal_year, budget_cat, phase)
+                 # Stateから値を取得
+                 sub = st.session_state.get("form_subject")
+                 amt = st.session_state.get("form_amount")
+                 cnt = st.session_state.get("form_content")
+                 fy = st.session_state.get("form_fy")
+                 cat = st.session_state.get("form_cat")
+                 ph = st.session_state.get("form_phase")
+                 
+                 save_data(conn, is_new, edit_id, my_uuid, sub, amt, cnt, "下書き", uploaded_files, st.session_state.get("draft_route", []), selected_template_id, custom_values, fy, cat, ph)
                  st.toast("下書き保存しました")
                  st.session_state["page_mode"] = "list"
                  st.rerun()
         with col_final2:
             btn_label = "起案・回付する" if is_new else "修正して再提出する"
             if st.button(btn_label, type="primary", use_container_width=True):
-                if not subject: st.warning("件名を入力してください")
+                sub = st.session_state.get("form_subject")
+                
+                if not sub: st.warning("件名を入力してください")
                 elif not st.session_state.get("draft_route"): st.warning("回付ルートを設定してください")
                 else:
-                    save_data(conn, is_new, edit_id, my_uuid, subject, amount, content, "申請中", uploaded_files, st.session_state["draft_route"], selected_template_id, custom_values, fiscal_year, budget_cat, phase)
+                    amt = st.session_state.get("form_amount")
+                    cnt = st.session_state.get("form_content")
+                    fy = st.session_state.get("form_fy")
+                    cat = st.session_state.get("form_cat")
+                    ph = st.session_state.get("form_phase")
+                    
+                    save_data(conn, is_new, edit_id, my_uuid, sub, amt, cnt, "申請中", uploaded_files, st.session_state["draft_route"], selected_template_id, custom_values, fy, cat, ph)
                     st.success("回付を開始しました！")
                     st.session_state["page_mode"] = "list"
                     st.rerun()
@@ -445,7 +456,6 @@ def save_data(conn, is_new, workflow_id, uid, subject, amount, content, status, 
         target_id = workflow_id
         json_str = json.dumps(custom_data, ensure_ascii=False) if custom_data else None
         
-        # applicant_idにUUIDを使用
         if is_new:
             row = s.execute(text("INSERT INTO T_Workflow_Header (applicant_id, subject, amount, content, status, template_id, custom_data, fiscal_year, budget_category, phase) VALUES (:uid, :sub, :amt, :cnt, :st, :tid, :cdata, :fy, :cat, :ph) RETURNING workflow_id"),
                             {"uid": uid, "sub": subject, "amt": amount, "cnt": content, "st": status, "tid": template_id, "cdata": json_str, "fy": fy, "cat": cat, "ph": ph}).fetchone()
@@ -459,7 +469,6 @@ def save_data(conn, is_new, workflow_id, uid, subject, amount, content, status, 
                 f_url, f_name = upload_file_to_storage(f)
                 if f_url: s.execute(text("INSERT INTO T_Workflow_Attachments (workflow_id, file_name, file_path) VALUES (:rid, :fn, :fp)"), {"rid": target_id, "fn": f_name, "fp": f_url})
 
-        # ルート更新
         if status == "申請中" and approver_list:
             s.execute(text(f"DELETE FROM T_Workflow_Approvals WHERE workflow_id={target_id}"))
             for i, user in enumerate(approver_list):
