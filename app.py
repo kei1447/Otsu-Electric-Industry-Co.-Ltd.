@@ -105,7 +105,9 @@ def main_app():
         st.caption("管理者メニュー")
         st.page_link("pages/90_template_builder.py", label="🛠 帳票テンプレート作成", icon="🛠")
         st.page_link("pages/99_admin_users.py", label="👥 社員マスタ管理", icon="👥")
+        st.page_link("pages/98_user_profile.py", label="👤 ユーザー設定 (PW変更)", icon="⚙️")
         
+
         st.divider()
         if st.button("ログアウト", type="secondary", use_container_width=True):
             st.session_state.clear()
