@@ -43,14 +43,28 @@ def main():
         st.error("ログインしてください。")
         st.stop()
     
-    my_name = st.session_state["user_name"]
-    my_role = st.session_state["role"]
+    # セッション情報
     my_email = st.session_state["user_email"]
 
     conn = st.connection("supabase", type="sql")
 
+    # ユーザー情報の取得 (UUIDが必要なため)
+    try:
+        user_sql = f"SELECT id, display_name, role, department_id FROM public.profiles WHERE email = '{my_email}'"
+        user_df = conn.query(user_sql, ttl=60)
+        if user_df.empty:
+            st.error("ユーザー情報が見つかりません。管理者にお問い合わせください。")
+            st.stop()
+        my_user = user_df.iloc[0]
+        my_uuid = my_user['id']
+        my_name = my_user['display_name']
+        my_role = my_user['role']
+    except Exception as e:
+        st.error(f"DB接続エラー: {e}")
+        st.stop()
+
     if st.button("＋ 新規起案", type="primary", use_container_width=True):
-        st.session_state["editing_ringi_id"] = None
+        st.session_state["editing_workflow_id"] = None
         st.session_state["page_mode"] = "edit"
         st.session_state["draft_route"] = [] 
         st.rerun()
@@ -64,17 +78,23 @@ def main():
     # モードA: 一覧画面
     # ==================================================
     if st.session_state["page_mode"] == "list":
-        # 起案分（ステータス：下書き、差戻しも含む）
-        sql_my_app = f"SELECT ringi_id, created_at, subject, amount, status, applicant_name, '起案分' as type FROM T_Ringi_Header WHERE applicant_email = '{my_email}'"
-        # 受信トレイ
+        # 起案分（自身のUUIDで検索）
+        sql_my_app = f"""
+            SELECT h.workflow_id, h.created_at, h.subject, h.amount, h.status, p.display_name as applicant_name, '起案分' as type 
+            FROM T_Workflow_Header h
+            JOIN public.profiles p ON h.applicant_id = p.id
+            WHERE h.applicant_id = '{my_uuid}'
+        """
+        # 受信トレイ（自身のUUIDで承認待ちを検索）
         sql_to_approve = f"""
             UNION ALL
-            SELECT h.ringi_id, h.created_at, h.subject, h.amount, '確認・承認待ち' as status, h.applicant_name, '受信トレイ' as type
-            FROM T_Ringi_Header h
-            JOIN T_Ringi_Approvals a ON h.ringi_id = a.ringi_id
-            WHERE a.approver_id = '{my_email}' AND a.status = '未承認' AND h.status != '却下'
+            SELECT h.workflow_id, h.created_at, h.subject, h.amount, '確認・承認待ち' as status, p.display_name as applicant_name, '受信トレイ' as type
+            FROM T_Workflow_Header h
+            JOIN T_Workflow_Approvals a ON h.workflow_id = a.workflow_id
+            JOIN public.profiles p ON h.applicant_id = p.id
+            WHERE a.approver_id = '{my_uuid}' AND a.status = '未承認' AND h.status != '却下'
         """
-        final_sql = f"SELECT * FROM ({sql_my_app} {sql_to_approve}) AS merged ORDER BY ringi_id DESC"
+        final_sql = f"SELECT * FROM ({sql_my_app} {sql_to_approve}) AS merged ORDER BY workflow_id DESC"
         df_list = conn.query(final_sql, ttl=0)
 
         tab1, tab2 = st.tabs(["📋 全案件ステータス", "✅ 受信トレイ (確認・承認)"])
@@ -83,22 +103,23 @@ def main():
             df_view = df_list[df_list['type'] == '起案分']
             if df_view.empty: st.info("データなし")
             else:
-                st.dataframe(df_view[["ringi_id", "created_at", "subject", "amount", "status"]], use_container_width=True, hide_index=True)
-                selected_id = st.selectbox("案件詳細を確認", df_view["ringi_id"], index=None)
+                st.dataframe(df_view[["workflow_id", "created_at", "subject", "amount", "status"]], use_container_width=True, hide_index=True)
+                selected_id = st.selectbox("案件詳細を確認", df_view["workflow_id"], index=None)
                 if selected_id:
-                    row = conn.query(f"SELECT * FROM T_Ringi_Header WHERE ringi_id = {selected_id}", ttl=0).iloc[0]
+                    # 詳細取得
+                    row = conn.query(f"SELECT * FROM T_Workflow_Header WHERE workflow_id = {selected_id}", ttl=0).iloc[0]
                     with st.container(border=True):
                         st.subheader(f"{row['subject']}")
                         
-                        # 下書き or 差戻し の場合は再編集ボタンを表示
+                        # 下書き or 差戻し
                         if row["status"] in ["下書き", "差戻し"]:
                             msg = "下書き編集中" if row["status"] == "下書き" else "⚠️ 差戻し案件です。内容を修正して再提出してください。"
                             st.warning(msg)
                             if st.button("✏️ 編集・再提出する"):
-                                st.session_state["editing_ringi_id"] = selected_id
+                                st.session_state["editing_workflow_id"] = selected_id
                                 st.session_state["page_mode"] = "edit"
                                 # ルート復元
-                                existing_route = conn.query(f"SELECT approver_id, approver_name, approver_role FROM T_Ringi_Approvals WHERE ringi_id={selected_id} ORDER BY step_order", ttl=0)
+                                existing_route = conn.query(f"SELECT approver_id, approver_name, approver_role FROM T_Workflow_Approvals WHERE workflow_id={selected_id} ORDER BY step_order", ttl=0)
                                 restored_route = []
                                 for _, r_row in existing_route.iterrows():
                                     restored_route.append({"id": r_row['approver_id'], "name": r_row['approver_name'], "role": r_row['approver_role']})
@@ -116,8 +137,8 @@ def main():
                             else:
                                 st.write(f"**内容:** {row['content']}")
                             st.markdown("---")
-                            # 履歴表示（差戻しコメントなども見えるように）
-                            steps = conn.query(f"SELECT step_order, approver_role, approver_name, status, comment FROM T_Ringi_Approvals WHERE ringi_id = {selected_id} ORDER BY step_order", ttl=0)
+                            # 履歴表示
+                            steps = conn.query(f"SELECT step_order, approver_role, approver_name, status, comment FROM T_Workflow_Approvals WHERE workflow_id = {selected_id} ORDER BY step_order", ttl=0)
                             for idx, s_row in steps.iterrows():
                                 icon = "✅" if s_row['status'] == '承認' else ("↩️" if s_row['status'] == '差戻し' else ("❌" if s_row['status'] == '却下' else "⏳"))
                                 st.write(f"{icon} {s_row['approver_name']} ({s_row['status']})")
@@ -129,10 +150,10 @@ def main():
             else:
                 for i, row in df_app.iterrows():
                     with st.container(border=True):
-                        st.markdown(f"**No.{row['ringi_id']} {row['subject']}**")
+                        st.markdown(f"**No.{row['workflow_id']} {row['subject']}**")
                         st.caption(f"起案者: {row['applicant_name']}")
                         
-                        detail_row = conn.query(f"SELECT * FROM T_Ringi_Header WHERE ringi_id={row['ringi_id']}", ttl=0).iloc[0]
+                        detail_row = conn.query(f"SELECT * FROM T_Workflow_Header WHERE workflow_id={row['workflow_id']}", ttl=0).iloc[0]
                         with st.expander("詳細を見る"):
                             if detail_row.get('phase') and detail_row.get('phase') != 'None':
                                 st.caption(f"💰 {detail_row.get('fiscal_year', '-')}年度 | {detail_row.get('budget_category', '-')} | {detail_row.get('phase', '-')}")
@@ -142,20 +163,21 @@ def main():
                                 for k, v in c_data.items(): st.write(f"**{k}:** {v}")
                             else:
                                 st.text(detail_row['content'])
-                            files = conn.query(f"SELECT file_name, file_url FROM T_Ringi_Attachments WHERE ringi_id = {row['ringi_id']}", ttl=0)
-                            for _, f in files.iterrows(): st.markdown(f"📎 [{f['file_name']}]({f['file_url']})")
+                            files = conn.query(f"SELECT file_name, file_path FROM T_Workflow_Attachments WHERE workflow_id = {row['workflow_id']}", ttl=0)
+                            # Note: storage public URL生成が必要だが、ここでは簡易的にファイル名表示のみ、あるいは別ロジックが必要
+                            # 今回は file_path (URL想定) をそのまま表示
+                            for _, f in files.iterrows(): 
+                                # file_pathにはURLが入っている想定（アップロード関数の戻り値）
+                                st.markdown(f"📎 {f['file_name']}") 
                         
-                        # --- ★ルート変更機能 (承認者による介入) ---
-                        with st.expander("⚙️ 承認ルートの確認・変更（次の回付先を追加できます）"):
-                            # 未来のステップ（自分より後のステップ）を取得
-                            current_step_df = conn.query(f"SELECT step_order FROM T_Ringi_Approvals WHERE ringi_id={row['ringi_id']} AND approver_id='{my_email}'", ttl=0)
+                        # --- ★ルート変更機能 ---
+                        with st.expander("⚙️ 承認ルートの確認・変更"):
+                            current_step_df = conn.query(f"SELECT step_order FROM T_Workflow_Approvals WHERE workflow_id={row['workflow_id']} AND approver_id='{my_uuid}'", ttl=0)
                             if not current_step_df.empty:
                                 current_step_order = current_step_df.iloc[0]['step_order']
-                                # 自分より後のルートを取得
-                                future_steps = conn.query(f"SELECT approval_id, approver_name, approver_role, approver_id FROM T_Ringi_Approvals WHERE ringi_id={row['ringi_id']} AND step_order > {current_step_order} ORDER BY step_order", ttl=0)
+                                future_steps = conn.query(f"SELECT approval_id, approver_name, approver_role, approver_id FROM T_Workflow_Approvals WHERE workflow_id={row['workflow_id']} AND step_order > {current_step_order} ORDER BY step_order", ttl=0)
                                 
-                                # SessionStateで管理するためのキー
-                                future_route_key = f"future_route_{row['ringi_id']}"
+                                future_route_key = f"future_route_{row['workflow_id']}"
                                 if future_route_key not in st.session_state:
                                     st.session_state[future_route_key] = []
                                     for _, fs in future_steps.iterrows():
@@ -163,70 +185,63 @@ def main():
                                             "id": fs['approver_id'], "name": fs['approver_name'], "role": fs['approver_role']
                                         })
 
-                                # ルート編集UI
                                 st.caption("▼ 現在予定されている後続のルート")
                                 current_future = st.session_state[future_route_key]
                                 
-                                # 追加用UI
-                                users_df = conn.query("SELECT display_name, role, user_id FROM M_Users ORDER BY role DESC", ttl=60)
+                                # ユーザー選択: profilesから取得
+                                users_df = conn.query("SELECT display_name, role, id FROM public.profiles ORDER BY role DESC", ttl=60)
                                 u_opts = {f"{r['display_name']} ({r['role']})": r for _, r in users_df.iterrows()}
-                                add_u = st.selectbox("承認者を追加", list(u_opts.keys()), key=f"add_sel_{row['ringi_id']}")
-                                if st.button("最後尾に追加", key=f"add_btn_{row['ringi_id']}"):
+                                add_u = st.selectbox("承認者を追加", list(u_opts.keys()), key=f"add_sel_{row['workflow_id']}")
+                                if st.button("最後尾に追加", key=f"add_btn_{row['workflow_id']}"):
                                     u_data = u_opts[add_u]
-                                    st.session_state[future_route_key].append({"id": u_data['user_id'], "name": u_data['display_name'], "role": u_data['role']})
+                                    st.session_state[future_route_key].append({"id": u_data['id'], "name": u_data['display_name'], "role": u_data['role']})
                                     st.rerun()
 
-                                # リスト表示
                                 if not current_future:
-                                    st.info("後続の承認者はいません（あなたが最終決裁者です）。必要であれば追加してください。")
+                                    st.info("後続の承認者はいません（あなたが最終決裁者です）。")
                                 else:
                                     for idx, fr in enumerate(current_future):
                                         fc1, fc2, fc3 = st.columns([0.5, 4, 1])
                                         with fc1: st.write(f"次+{idx+1}")
                                         with fc2: st.write(f"**{fr['name']}** ({fr['role']})")
                                         with fc3: 
-                                            if st.button("削除", key=f"del_f_{row['ringi_id']}_{idx}"):
+                                            if st.button("削除", key=f"del_f_{row['workflow_id']}_{idx}"):
                                                 st.session_state[future_route_key].pop(idx)
                                                 st.rerun()
 
                         # 承認アクション
-                        comment = st.text_input("💬 コメント / 申し送り事項", key=f"cmt_{row['ringi_id']}")
+                        comment = st.text_input("💬 コメント / 申し送り事項", key=f"cmt_{row['workflow_id']}")
                         c_a, c_b = st.columns(2)
                         
                         with c_a:
-                            if st.button("承認 / 回付", key=f"app_{row['ringi_id']}", type="primary", use_container_width=True):
+                            if st.button("承認 / 回付", key=f"app_{row['workflow_id']}", type="primary", use_container_width=True):
                                 with conn.session as s:
                                     now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
                                     
-                                    # 1. 自分のステータスを承認にする
-                                    s.execute(text("UPDATE T_Ringi_Approvals SET status='承認', approved_at=:at, comment=:cm WHERE ringi_id=:rid AND approver_id=:uid"), 
-                                              {"at": now, "cm": comment, "rid": row['ringi_id'], "uid": my_email})
+                                    # 1. 承認
+                                    s.execute(text("UPDATE T_Workflow_Approvals SET status='承認', approved_at=:at, comment=:cm WHERE workflow_id=:rid AND approver_id=:uid"), 
+                                                {"at": now, "cm": comment, "rid": row['workflow_id'], "uid": my_uuid})
                                     
-                                    # 2. ★ルート変更の反映★
-                                    # 自分より後のステップを一旦全削除し、編集後のリストで再登録する
-                                    current_step_df = conn.query(f"SELECT step_order FROM T_Ringi_Approvals WHERE ringi_id={row['ringi_id']} AND approver_id='{my_email}'", ttl=0)
+                                    # 2. ルート再構築
+                                    current_step_df = conn.query(f"SELECT step_order FROM T_Workflow_Approvals WHERE workflow_id={row['workflow_id']} AND approver_id='{my_uuid}'", ttl=0)
                                     cur_step = current_step_df.iloc[0]['step_order']
                                     
-                                    # 後続削除
-                                    s.execute(text(f"DELETE FROM T_Ringi_Approvals WHERE ringi_id={row['ringi_id']} AND step_order > {cur_step}"))
+                                    s.execute(text(f"DELETE FROM T_Workflow_Approvals WHERE workflow_id={row['workflow_id']} AND step_order > {cur_step}"))
                                     
-                                    # 新ルート登録
-                                    future_route_key = f"future_route_{row['ringi_id']}"
+                                    future_route_key = f"future_route_{row['workflow_id']}"
                                     if future_route_key in st.session_state:
                                         new_route = st.session_state[future_route_key]
                                         for i, usr in enumerate(new_route):
                                             s.execute(text("""
-                                                INSERT INTO T_Ringi_Approvals (ringi_id, step_order, approver_id, approver_name, approver_role)
+                                                INSERT INTO T_Workflow_Approvals (workflow_id, step_order, approver_id, approver_name, approver_role)
                                                 VALUES (:rid, :ord, :uid, :nm, :role)
-                                            """), {"rid": row['ringi_id'], "ord": cur_step + 1 + i, "uid": usr['id'], "nm": usr['name'], "role": usr['role']})
-                                        
-                                        # メモリ解放
+                                            """), {"rid": row['workflow_id'], "ord": cur_step + 1 + i, "uid": usr['id'], "nm": usr['name'], "role": usr['role']})
                                         del st.session_state[future_route_key]
 
-                                    # 3. 完了判定（後続がいなければ完了）
-                                    pending = s.execute(text(f"SELECT count(*) FROM T_Ringi_Approvals WHERE ringi_id={row['ringi_id']} AND status='未承認'")).fetchone()[0]
+                                    # 3. 完了判定
+                                    pending = s.execute(text(f"SELECT count(*) FROM T_Workflow_Approvals WHERE workflow_id={row['workflow_id']} AND status='未承認'")).fetchone()[0]
                                     if pending == 0:
-                                        s.execute(text("UPDATE T_Ringi_Header SET status='決裁完了' WHERE ringi_id=:rid"), {"rid": row['ringi_id']})
+                                        s.execute(text("UPDATE T_Workflow_Header SET status='決裁完了' WHERE workflow_id=:rid"), {"rid": row['workflow_id']})
                                     
                                     s.commit()
                                 
@@ -235,28 +250,24 @@ def main():
                                 st.rerun()
 
                         with c_b:
-                            # ★差戻し機能の実装
-                            if st.button("差戻し (修正依頼)", key=f"remand_{row['ringi_id']}", use_container_width=True):
+                            if st.button("差戻し", key=f"remand_{row['workflow_id']}", use_container_width=True):
                                  with conn.session as s:
-                                    # 自分の承認レコードを「差戻し」にする
-                                    s.execute(text("UPDATE T_Ringi_Approvals SET status='差戻し', approved_at=:at, comment=:cm WHERE ringi_id=:rid AND approver_id=:uid"), 
-                                              {"at": datetime.datetime.now(), "cm": comment, "rid": row['ringi_id'], "uid": my_email})
-                                    # ヘッダーのステータスも「差戻し」にする（これで申請者が編集可能になる）
-                                    s.execute(text("UPDATE T_Ringi_Header SET status='差戻し' WHERE ringi_id=:rid"), {"rid": row['ringi_id']})
+                                    s.execute(text("UPDATE T_Workflow_Approvals SET status='差戻し', approved_at=:at, comment=:cm WHERE workflow_id=:rid AND approver_id=:uid"), 
+                                                {"at": datetime.datetime.now(), "cm": comment, "rid": row['workflow_id'], "uid": my_uuid})
+                                    s.execute(text("UPDATE T_Workflow_Header SET status='差戻し' WHERE workflow_id=:rid"), {"rid": row['workflow_id']})
                                     s.commit()
                                  
                                  send_email_notification("applicant@example.com", f"【差戻】{row['subject']}", f"修正依頼: {comment}")
-                                 st.warning("申請者に差し戻しました")
+                                 st.warning("差し戻しました")
                                  st.rerun()
 
     # ==================================================
-    # モードB: 編集・起案画面 (前回と同じだが、再提出対応)
+    # モードB: 編集・起案画面
     # ==================================================
     elif st.session_state["page_mode"] == "edit":
-        edit_id = st.session_state.get("editing_ringi_id")
+        edit_id = st.session_state.get("editing_workflow_id")
         is_new = edit_id is None
         
-        # タイトル変更（差戻し対応）
         page_title = "📝 新規起案" if is_new else "✏️ 案件編集・再提出"
         st.subheader(page_title)
         
@@ -273,7 +284,7 @@ def main():
         loaded_custom_data = {}
 
         if not is_new:
-            existing = conn.query(f"SELECT * FROM T_Ringi_Header WHERE ringi_id = {edit_id}", ttl=0).iloc[0]
+            existing = conn.query(f"SELECT * FROM T_Workflow_Header WHERE workflow_id = {edit_id}", ttl=0).iloc[0]
             default_subject = existing["subject"]
             default_amount = existing["amount"]
             default_content = existing["content"]
@@ -305,9 +316,9 @@ def main():
                 with c_y: fiscal_year = st.number_input("対象年度", value=default_fy if default_fy else 2025, step=1)
                 with c_c: budget_cat = st.selectbox("予算区分", ["予算内", "突発(予算外)", "その他"], index=["予算内", "突発(予算外)", "その他"].index(default_cat) if default_cat in ["予算内", "突発(予算外)", "その他"] else 0)
                 with c_p: phase = st.selectbox("フェーズ", ["執行", "計画(来期予算等)", "報告のみ"], index=["執行", "計画(来期予算等)", "報告のみ"].index(default_phase) if default_phase in ["執行", "計画(来期予算等)", "報告のみ"] else 0)
-                amount = st.number_input("金額 (円)", value=default_amount, step=1000)
+                amount = st.number_input("金額 (円)", value=int(default_amount) if default_amount else 0, step=1000)
             else:
-                amount = st.number_input("金額 (円) ※必要な場合のみ", value=default_amount, step=1000)
+                amount = st.number_input("金額 (円) ※必要な場合のみ", value=int(default_amount) if default_amount else 0, step=1000)
 
             st.markdown("##### 2. 詳細内容")
             custom_values = {}
@@ -322,6 +333,7 @@ def main():
                 if isinstance(schema, str): schema = json.loads(schema)
                 
                 content = ""
+                # ダイナミックフォーム生成ロジックは既存踏襲
                 fields = schema
                 rows = []
                 current_row = []
@@ -357,6 +369,7 @@ def main():
                                 idx = opts.index(init_val) if init_val in opts else 0
                                 val = st.selectbox(label, opts, index=idx)
                             elif typ == "checkbox": val = st.checkbox(label, value=bool(init_val))
+                            
                             if isinstance(val, (datetime.date, datetime.datetime)): custom_values[label] = str(val)
                             else: custom_values[label] = val
 
@@ -368,13 +381,12 @@ def main():
                 if st.form_submit_button("キャンセル"):
                     st.session_state["page_mode"] = "list"
                     st.rerun()
-            with c2:
-                pass
 
-        # ルートビルダー (再提出時は既存ルートを修正可能)
+        # ルートビルダー
         st.markdown("##### 4. 回付・承認ルート設定")
         with st.container(border=True):
-            users_df = conn.query("SELECT display_name, role, user_id FROM M_Users ORDER BY role DESC", ttl=60)
+            # profilesからユーザーリスト取得
+            users_df = conn.query("SELECT display_name, role, id FROM public.profiles ORDER BY role DESC", ttl=60)
             user_options = {f"{row['display_name']} ({row['role']})": row for i, row in users_df.iterrows()}
             
             c_add1, c_add2 = st.columns([3, 1])
@@ -383,9 +395,9 @@ def main():
             with c_add2:
                 if st.button("ルートに追加"):
                     u_row = user_options[selected_user_label]
-                    # State初期化忘れ対策
                     if "draft_route" not in st.session_state: st.session_state["draft_route"] = []
-                    st.session_state["draft_route"].append({"id": u_row['user_id'], "name": u_row['display_name'], "role": u_row['role']})
+                    # idはUUID
+                    st.session_state["draft_route"].append({"id": u_row['id'], "name": u_row['display_name'], "role": u_row['role']})
                     st.rerun()
 
             if not st.session_state.get("draft_route"):
@@ -413,7 +425,7 @@ def main():
         col_final1, col_final2 = st.columns(2)
         with col_final1:
             if st.button("下書き保存", use_container_width=True):
-                 save_data(conn, is_new, edit_id, my_name, my_email, subject, amount, content, "下書き", uploaded_files, st.session_state.get("draft_route", []), selected_template_id, custom_values, fiscal_year, budget_cat, phase)
+                 save_data(conn, is_new, edit_id, my_uuid, subject, amount, content, "下書き", uploaded_files, st.session_state.get("draft_route", []), selected_template_id, custom_values, fiscal_year, budget_cat, phase)
                  st.toast("下書き保存しました")
                  st.session_state["page_mode"] = "list"
                  st.rerun()
@@ -423,35 +435,35 @@ def main():
                 if not subject: st.warning("件名を入力してください")
                 elif not st.session_state.get("draft_route"): st.warning("回付ルートを設定してください")
                 else:
-                    save_data(conn, is_new, edit_id, my_name, my_email, subject, amount, content, "申請中", uploaded_files, st.session_state["draft_route"], selected_template_id, custom_values, fiscal_year, budget_cat, phase)
+                    save_data(conn, is_new, edit_id, my_uuid, subject, amount, content, "申請中", uploaded_files, st.session_state["draft_route"], selected_template_id, custom_values, fiscal_year, budget_cat, phase)
                     st.success("回付を開始しました！")
                     st.session_state["page_mode"] = "list"
                     st.rerun()
 
-def save_data(conn, is_new, ringi_id, name, email, subject, amount, content, status, files, approver_list, template_id, custom_data, fy, cat, ph):
+def save_data(conn, is_new, workflow_id, uid, subject, amount, content, status, files, approver_list, template_id, custom_data, fy, cat, ph):
     with conn.session as s:
-        target_id = ringi_id
+        target_id = workflow_id
         json_str = json.dumps(custom_data, ensure_ascii=False) if custom_data else None
         
+        # applicant_idにUUIDを使用
         if is_new:
-            row = s.execute(text("INSERT INTO T_Ringi_Header (applicant_name, applicant_email, subject, amount, content, status, template_id, custom_data, fiscal_year, budget_category, phase) VALUES (:nm, :em, :sub, :amt, :cnt, :st, :tid, :cdata, :fy, :cat, :ph) RETURNING ringi_id"),
-                            {"nm": name, "em": email, "sub": subject, "amt": amount, "cnt": content, "st": status, "tid": template_id, "cdata": json_str, "fy": fy, "cat": cat, "ph": ph}).fetchone()
+            row = s.execute(text("INSERT INTO T_Workflow_Header (applicant_id, subject, amount, content, status, template_id, custom_data, fiscal_year, budget_category, phase) VALUES (:uid, :sub, :amt, :cnt, :st, :tid, :cdata, :fy, :cat, :ph) RETURNING workflow_id"),
+                            {"uid": uid, "sub": subject, "amt": amount, "cnt": content, "st": status, "tid": template_id, "cdata": json_str, "fy": fy, "cat": cat, "ph": ph}).fetchone()
             target_id = row[0]
         else:
-            s.execute(text("UPDATE T_Ringi_Header SET subject=:sub, amount=:amt, content=:cnt, status=:st, template_id=:tid, custom_data=:cdata, fiscal_year=:fy, budget_category=:cat, phase=:ph WHERE ringi_id=:rid"),
-                      {"sub": subject, "amt": amount, "cnt": content, "st": status, "tid": template_id, "cdata": json_str, "rid": ringi_id, "fy": fy, "cat": cat, "ph": ph})
+            s.execute(text("UPDATE T_Workflow_Header SET subject=:sub, amount=:amt, content=:cnt, status=:st, template_id=:tid, custom_data=:cdata, fiscal_year=:fy, budget_category=:cat, phase=:ph WHERE workflow_id=:rid"),
+                      {"sub": subject, "amt": amount, "cnt": content, "st": status, "tid": template_id, "cdata": json_str, "rid": workflow_id, "fy": fy, "cat": cat, "ph": ph})
         
         if files:
             for f in files:
                 f_url, f_name = upload_file_to_storage(f)
-                if f_url: s.execute(text("INSERT INTO T_Ringi_Attachments (ringi_id, file_name, file_url) VALUES (:rid, :fn, :fu)"), {"rid": target_id, "fn": f_name, "fu": f_url})
+                if f_url: s.execute(text("INSERT INTO T_Workflow_Attachments (workflow_id, file_name, file_path) VALUES (:rid, :fn, :fp)"), {"rid": target_id, "fn": f_name, "fp": f_url})
 
-        # ルート更新 (新規 or 再提出時)
-        # ステータスが「申請中」になるタイミングで、指定されたルートで洗い替えを行う
+        # ルート更新
         if status == "申請中" and approver_list:
-            s.execute(text(f"DELETE FROM T_Ringi_Approvals WHERE ringi_id={target_id}"))
+            s.execute(text(f"DELETE FROM T_Workflow_Approvals WHERE workflow_id={target_id}"))
             for i, user in enumerate(approver_list):
-                s.execute(text("INSERT INTO T_Ringi_Approvals (ringi_id, step_order, approver_id, approver_name, approver_role) VALUES (:rid, :ord, :uid, :nm, :role)"),
+                s.execute(text("INSERT INTO T_Workflow_Approvals (workflow_id, step_order, approver_id, approver_name, approver_role) VALUES (:rid, :ord, :uid, :nm, :role)"),
                           {"rid": target_id, "ord": i+1, "uid": user['id'], "nm": user['name'], "role": user['role']})
         s.commit()
 
